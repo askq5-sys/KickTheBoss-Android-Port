@@ -1,0 +1,3110 @@
+diff --git a/.gitignore b/.gitignore
+index cb9213d..0b8f72d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -38,3 +38,6 @@ tools/__pycache__/
+ signing.properties
+ local.properties
+ crash.txt.bak
++# bundled game APK: copyrighted, never commit
++android/launcher/app/src/kicktheboss/assets/
++android/launcher/app/src/wwz/assets/
+diff --git a/android/launcher/app/build.gradle.kts b/android/launcher/app/build.gradle.kts
+index 4d8f09d..d7264c7 100644
+--- a/android/launcher/app/build.gradle.kts
++++ b/android/launcher/app/build.gradle.kts
+@@ -47,6 +47,36 @@ android {
+             if (hasReleaseKey) signingConfig = signingConfigs.getByName("release")
+         }
+     }
++    // zb-opt-r2: lint must not block the release build of a bundled game.
++    lint {
++        checkReleaseBuilds = false
++        abortOnError = false
++    }
++    flavorDimensions += "app"
++    productFlavors {
++        // The general launcher: import any APK, library screen.
++        create("library") {
++            dimension = "app"
++        }
++        // One game bundled inside (src/kicktheboss/assets/bundled/game.apk, kept out of git).
++        create("kicktheboss") {
++            dimension = "app"
++            applicationId = "com.zettabridge.kicktheboss"
++            versionName = "3.0.0"
++            versionCode = 300
++        }
++        // World War Z (Unreal Engine 3). src/wwz/assets/bundled/game.apk, kept out of git;
++        // the OBB expansion files stay in /sdcard/Android/obb/com.zettabridge.wwz/.
++        create("wwz") {
++            dimension = "app"
++            applicationId = "com.zettabridge.wwz"
++            versionName = "1.3.4-zb"
++            versionCode = 1
++        }
++    }
++    androidResources {
++        noCompress += listOf("apk")
++    }
+     compileOptions {
+         sourceCompatibility = JavaVersion.VERSION_17
+         targetCompatibility = JavaVersion.VERSION_17
+diff --git a/android/launcher/app/src/kicktheboss/AndroidManifest.xml b/android/launcher/app/src/kicktheboss/AndroidManifest.xml
+new file mode 100644
+index 0000000..7ffd439
+--- /dev/null
++++ b/android/launcher/app/src/kicktheboss/AndroidManifest.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:tools="http://schemas.android.com/tools">
++    <!-- zb-cleanup: the game's ad/analytics/billing SDKs are cut off and it needs no network. -->
++    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
++    <application
++        android:label="Kick the Boss"
++        android:icon="@mipmap/ic_launcher"
++        tools:replace="android:label,android:icon">
++        <!-- No library screen on the home screen: the bundled game is the app. -->
++        <activity
++            android:name=".LibraryActivity"
++            android:exported="false"
++            tools:node="replace" />
++        <activity
++            android:name=".BundledGameActivity"
++            android:exported="true"
++            android:excludeFromRecents="true"
++            android:screenOrientation="sensorLandscape"
++            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++    </application>
++</manifest>
+diff --git a/android/launcher/app/src/kicktheboss/java/com/zettabridge/launcher/BundledGameActivity.java b/android/launcher/app/src/kicktheboss/java/com/zettabridge/launcher/BundledGameActivity.java
+new file mode 100644
+index 0000000..093a603
+--- /dev/null
++++ b/android/launcher/app/src/kicktheboss/java/com/zettabridge/launcher/BundledGameActivity.java
+@@ -0,0 +1,117 @@
++package com.zettabridge.launcher;
++
++import android.app.Activity;
++import android.content.Intent;
++import android.content.SharedPreferences;
++import android.graphics.Color;
++import android.os.Bundle;
++import android.view.Gravity;
++import android.widget.TextView;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.Locale;
++
++/**
++ * Home-screen entry of a single-game build. The game APK ships as an asset; it is imported through
++ * the normal plugin import on first launch and again only when the bundled copy changes (its
++ * version file differs). Import keeps the plugin's data directory, so saves survive updates.
++ */
++public class BundledGameActivity extends Activity {
++    private static final String ASSET_APK = "bundled/game.apk";
++    private static final String ASSET_VERSION = "bundled/game.version";
++    private static final String PREFS = "bundled-game";
++
++    private TextView status;
++
++    @Override
++    protected void onCreate(Bundle state) {
++        super.onCreate(state);
++        final String wanted;
++        try {
++            wanted = readAsset(ASSET_VERSION).trim();
++        } catch (IOException e) {
++            fail("The game is not bundled in this build: " + e.getMessage());
++            return;
++        }
++        final SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
++        final String pkg = prefs.getString("package", null);
++        final PluginRecord installed = pkg != null ? PluginStore.find(this, pkg) : null;
++        if (installed != null && installed.isLaunchable() && wanted.equals(prefs.getString("version", null))) {
++            launch(pkg);
++            return;
++        }
++        status = new TextView(this);
++        status.setTextColor(Color.WHITE);
++        status.setBackgroundColor(Color.BLACK);
++        status.setGravity(Gravity.CENTER);
++        status.setTextSize(18);
++        status.setText(progressText(installed == null));  // zb-ui: localized
++        setContentView(status);
++        new Thread(() -> {
++            try {
++                PluginRecord r = PluginStore.importStream(this, getAssets().open(ASSET_APK));
++                prefs.edit().putString("package", r.packageName).putString("version", wanted).commit();
++                runOnUiThread(() -> launch(r.packageName));
++            } catch (Exception e) {
++                runOnUiThread(() -> fail("Cannot prepare the game: " + e));
++            }
++        }, "zb-bundled-import").start();
++    }
++
++    private void launch(String packageName) {
++        startActivity(PluginSwitchActivity.intent(this, packageName));
++        finishAndRemoveTask();  // zb-ui: the game's own task is the only one in Recents
++    }
++
++    private void fail(String message) {
++        Diagnostics.report(this, message, null, false);
++        TextView t = status != null ? status : new TextView(this);
++        t.setText(message + "\n\nTap to open the ZettaBridge library.");
++        t.setOnClickListener(v -> {
++            startActivity(new Intent(this, LibraryActivity.class));
++            finish();
++        });
++        if (status == null) {
++            t.setGravity(Gravity.CENTER);
++            setContentView(t);
++        }
++    }
++
++    /** zb-ui: the progress line in the phone language (the game's ten languages, else English). */
++    private static String progressText(boolean firstLaunch) {
++        Locale l = Locale.getDefault();
++        String lang = l.getLanguage();
++        if ("zh".equals(lang)) {
++            String script = l.getScript();
++            String country = l.getCountry();
++            boolean hant = "Hant".equals(script) || (script.isEmpty()
++                    && ("TW".equals(country) || "HK".equals(country) || "MO".equals(country)));
++            lang = hant ? "zh-Hant" : "zh-Hans";
++        }
++        switch (lang) {
++            case "ru": return firstLaunch ? "Подготовка игры (первый запуск)..." : "Обновление игры...";
++            case "zh-Hant": return firstLaunch ? "正在準備遊戲（首次啟動）..." : "正在更新遊戲...";
++            case "zh-Hans": return firstLaunch ? "正在准备游戏（首次启动）..." : "正在更新游戏...";
++            case "ja": return firstLaunch ? "ゲームを準備しています（初回起動）..." : "ゲームを更新しています...";
++            case "es": return firstLaunch ? "Preparando el juego (primer inicio)..." : "Actualizando el juego...";
++            case "fr": return firstLaunch ? "Préparation du jeu (premier lancement)..." : "Mise à jour du jeu...";
++            case "de": return firstLaunch ? "Spiel wird vorbereitet (erster Start)..." : "Spiel wird aktualisiert...";
++            case "sv": return firstLaunch ? "Förbereder spelet (första start)..." : "Uppdaterar spelet...";
++            case "ko": return firstLaunch ? "게임 준비 중 (첫 실행)..." : "게임 업데이트 중...";
++            default: return firstLaunch ? "Preparing the game (first launch)..." : "Updating the game...";
++        }
++    }
++
++    private String readAsset(String name) throws IOException {
++        try (InputStream in = getAssets().open(name)) {
++            ByteArrayOutputStream out = new ByteArrayOutputStream();
++            byte[] buf = new byte[256];
++            int n;
++            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
++            return new String(out.toByteArray(), StandardCharsets.US_ASCII);
++        }
++    }
++}
+diff --git a/android/launcher/app/src/main/AndroidManifest.xml b/android/launcher/app/src/main/AndroidManifest.xml
+index b00d147..629c0b0 100644
+--- a/android/launcher/app/src/main/AndroidManifest.xml
++++ b/android/launcher/app/src/main/AndroidManifest.xml
+@@ -14,6 +14,10 @@
+         android:label="ZettaBridge"
+         android:icon="@android:drawable/sym_def_app_icon"
+         android:theme="@android:style/Theme.Material.Light.DarkActionBar">
++        <!-- KTB37_APACHE_LEGACY -->
++        <uses-library
++            android:name="org.apache.http.legacy"
++            android:required="false" />
+ 
+         <activity
+             android:name=".LibraryActivity"
+@@ -31,14 +35,14 @@
+             android:name=".PluginSwitchActivity"
+             android:exported="true"
+             android:excludeFromRecents="true"
+-            android:taskAffinity="com.zettabridge.launcher.switch"
++            android:taskAffinity="${applicationId}.switch"
+             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+ 
+         <activity
+             android:name=".GuestLaunchActivity"
+             android:exported="true"
+             android:process=":guest"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.NoDisplay" />
+ 
+         <!-- Stub pool. GuestInstrumentation replaces each with the plugin activity named in the intent. -->
+@@ -49,7 +53,7 @@
+             android:hardwareAccelerated="true"
+             android:launchMode="standard"
+             android:process=":guest"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <activity
+             android:name=".Stubs$Landscape"
+@@ -59,7 +63,7 @@
+             android:launchMode="standard"
+             android:process=":guest"
+             android:screenOrientation="sensorLandscape"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <activity
+             android:name=".Stubs$Portrait"
+@@ -69,7 +73,7 @@
+             android:launchMode="standard"
+             android:process=":guest"
+             android:screenOrientation="sensorPortrait"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <activity
+             android:name=".Stubs$SingleTop"
+@@ -78,7 +82,7 @@
+             android:hardwareAccelerated="true"
+             android:launchMode="singleTop"
+             android:process=":guest"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <activity
+             android:name=".Stubs$SingleTask"
+@@ -87,7 +91,7 @@
+             android:hardwareAccelerated="true"
+             android:launchMode="singleTask"
+             android:process=":guest"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <activity
+             android:name=".Stubs$SingleInstance"
+@@ -96,7 +100,7 @@
+             android:hardwareAccelerated="true"
+             android:launchMode="singleInstance"
+             android:process=":guest"
+-            android:taskAffinity="com.zettabridge.launcher.guest"
++            android:taskAffinity="${applicationId}.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
+         <!-- AndroidIDE injects the Kotlin-based LogWire logger into debug builds. This app has no
+              Kotlin stdlib, so its init provider crashes the main process. Drop it. -->
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestInstrumentation.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestInstrumentation.java
+index bc7723d..573899b 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestInstrumentation.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestInstrumentation.java
+@@ -46,6 +46,7 @@ final class GuestInstrumentation extends Instrumentation {
+         runtime.prepareActivity(activity, icicle);
+         base.callActivityOnCreate(activity, icicle);
+         GuestWindowStyle.afterCreate(activity);
++        ktbAttach(activity);  // KTB_CHEAT
+     }
+ 
+     @Override
+@@ -53,6 +54,18 @@ final class GuestInstrumentation extends Instrumentation {
+         runtime.prepareActivity(activity, icicle);
+         base.callActivityOnCreate(activity, icicle, persistentState);
+         GuestWindowStyle.afterCreate(activity);
++        ktbAttach(activity);  // KTB_CHEAT
++    }
++
++    private static void ktbAttach(Activity activity) {
++        try {
++            Class.forName("com.zettabridge.launcher.KtbCheat").getMethod("attach", Activity.class)
++                    .invoke(null, activity);
++        } catch (ClassNotFoundException absent) {
++            // library flavor
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            Log.w(TAG, "KtbCheat.attach failed", e);
++        }
+     }
+ 
+     @Override
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
+index c1dfba7..81e8f75 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
+@@ -69,6 +69,7 @@ final class GuestRuntime {
+             installed = true;
+             Log.i(TAG, "guest Instrumentation installed");
+             PackageManagerHook.install(app, this);
++            TelephonyHook.install(app);
+         } catch (ReflectiveOperationException | RuntimeException e) {
+             Log.e(TAG, "cannot install the guest Instrumentation; plugins will not launch", e);
+         }
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/LoadedPlugin.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/LoadedPlugin.java
+index 015adda..44b90d2 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/LoadedPlugin.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/LoadedPlugin.java
+@@ -75,12 +75,52 @@ final class LoadedPlugin {
+             throw new IllegalStateException("cannot create " + record.dataDir());
+         }
+         if (record.isTranslated()) RuntimeBundle.install(host);
++        // Stage 30: materialize legacy Unity 4 Mono assemblies before native loading.
++        // This is also applied to already imported games: no reimport or loss of saves.
++        if (record.isTranslated()) MonoAssetCompat.ensure(record);
++        if (record.isTranslated()) {
++            java.io.File corelib = new java.io.File(
++                    record.dir, "zb-asset-files/assets/bin/Data/Managed/mono/2.0/mscorlib.dll");
++            android.util.Log.i("zb-mono-compat", "Stage 31 corelib exists=" +
++                    corelib.isFile() + " size=" + corelib.length());
++        }
+         // Plugin dex is child-first and isolated from launcher implementation classes. Only the
+         // stable com.zettabridge.core bridge is explicitly delegated to the launcher loader.
+         ClassLoader cl = new PluginClassLoader(record, codeCache, RuntimeBundle.proxyLibrary(host),
+                 android.content.Context.class.getClassLoader(), ZBridge.class.getClassLoader());
+ 
++        // KTB37_APACHE_PROBE
++        if ("com.gamehivecorp.kicktheboss.android".equals(record.packageName)) {
++            for (String name : new String[] {
++                    "org.apache.http.client.methods.HttpGet",
++                    "org.apache.http.conn.scheme.SchemeRegistry"
++            }) {
++                try {
++                    Class<?> found = cl.loadClass(name);
++                    Log.i("zb-apache-compat", "Stage 37 FOUND " + name
++                            + " via " + found.getClassLoader());
++                } catch (Throwable error) {
++                    Log.e("zb-apache-compat", "Stage 37 MISSING " + name, error);
++                }
++            }
++        }
++
+         LoadedPlugin p = new LoadedPlugin(record, ai, res, cl);
++        // Stage 33: verify the PLUGIN AssetManager can read mscorlib, not
++        // merely that our mirrored disk file exists. Read only the MZ header.
++        if (record.isTranslated() && new File(record.dir,
++                "zb-asset-files/assets/bin/Data/Managed/mscorlib.dll").isFile()) {
++            try (java.io.InputStream stream = res.getAssets().open(
++                    "bin/Data/Managed/mscorlib.dll")) {
++                int magic0 = stream.read();
++                int magic1 = stream.read();
++                Log.i("zb-mono-compat", "Stage 33 AssetManager mscorlib=" +
++                        ((magic0 == 0x4d && magic1 == 0x5a) ? "MZ OK" : "BAD MAGIC") +
++                        " bytes=" + magic0 + "," + magic1);
++            } catch (java.io.IOException exception) {
++                Log.w("zb-mono-compat", "Stage 33 AssetManager cannot open mscorlib", exception);
++            }
++        }
+         p.info = info;
+         if (record.isTranslated()) {
+             // Must precede activatePlugin: the guest runtime is process-lifetime and reads
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/MainLooperGuard.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/MainLooperGuard.java
+index 5f6cac9..49a2f15 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/MainLooperGuard.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/MainLooperGuard.java
+@@ -31,7 +31,7 @@ final class MainLooperGuard {
+                     return;  // the looper quit
+                 } catch (Throwable t) {
+                     if (!swallowed(t)) throw t;
+-                    Diagnostics.report(app, "swallowed a Google Play services exception on the main thread", t, false);
++                    Diagnostics.report(app, "swallowed an obsolete plugin SDK exception on the main thread", t, false);
+                     Log.w(TAG, "main looper guard: continuing after " + t);
+                 }
+             }
+@@ -45,6 +45,13 @@ final class MainLooperGuard {
+         for (String prefix : SWALLOWED_PREFIXES) {
+             if (thrower.startsWith(prefix)) return true;
+         }
++        // KTB36_PLAYHAVEN_GUARD
++        // Ignore linkage failures from the obsolete PlayHaven ad SDK.
++        if (t instanceof LinkageError &&
++                (thrower.startsWith("v2.com.playhaven.") ||
++                 thrower.startsWith("com.playhaven."))) {
++            return true;
++        }
+         return false;
+     }
+ }
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/MonoAssetCompat.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/MonoAssetCompat.java
+new file mode 100644
+index 0000000..4edbe6c
+--- /dev/null
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/MonoAssetCompat.java
+@@ -0,0 +1,81 @@
++package com.zettabridge.launcher;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.util.Enumeration;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++/**
++ * Unity 4 Mono opens assemblies as ordinary filesystem paths, but on current
++ * Android the plugin APK is an opaque ZIP. Make an on-disk mirror of ONLY the
++ * Unity managed DLLs, leaving assets and all game data in the real APK.
++ */
++final class MonoAssetCompat {
++    private static final String PREFIX = "assets/bin/Data/Managed/";
++
++    private MonoAssetCompat() {}
++
++    static void ensure(PluginRecord record) throws IOException {
++        File root = new File(record.dir, "zb-asset-files/assets/bin/Data/Managed");
++        if (!root.isDirectory() && !root.mkdirs())
++            throw new IOException("Cannot create Unity Mono mirror " + root);
++        boolean sawMscorlib = false;
++        try (ZipFile zip = new ZipFile(record.apk())) {
++            Enumeration<? extends ZipEntry> entries = zip.entries();
++            while (entries.hasMoreElements()) {
++                ZipEntry entry = entries.nextElement();
++                String path = entry.getName();
++                if (entry.isDirectory() || !path.startsWith(PREFIX)) continue;
++                String name = path.substring(PREFIX.length());
++                if (name.isEmpty() || name.equals(".") || name.equals("..") ||
++                    name.contains("/") || name.contains("\\") || !name.endsWith(".dll")) continue;
++                copy(zip, entry, new File(root, name));
++                if (name.equals("mscorlib.dll")) {
++                    sawMscorlib = true;
++                    // Mono also looks for its corelib in mono/2.0/mscorlib.dll.
++                    copy(zip, entry, new File(root, "mono/2.0/mscorlib.dll"));
++                }
++            }
++        }
++        // Other 32-bit plugins need not be Unity/Mono; no corelib is fine.
++        if (sawMscorlib) android.util.Log.i("zb-mono-compat",
++                "Unity Mono assemblies mirrored to " + root.getAbsolutePath());
++    }
++
++    private static void copy(ZipFile zip, ZipEntry entry, File out) throws IOException {
++        // zb-opt-r2: a same-size DLL with other content (a patched build) must be refreshed too,
++        // so the copy is stamped with the entry's CRC.
++        File stamp = new File(out.getParentFile(), out.getName() + ".zb-crc");
++        String want = Long.toHexString(entry.getCrc()) + ":" + entry.getSize();
++        if (out.isFile() && out.length() == entry.getSize() && stamp.isFile()) {
++            try {
++                String have = new String(java.nio.file.Files.readAllBytes(stamp.toPath()),
++                        java.nio.charset.StandardCharsets.US_ASCII).trim();
++                if (want.equals(have)) return;
++            } catch (IOException ignored) {
++                // unreadable stamp: copy again
++            }
++        }
++        File parent = out.getParentFile();
++        if (!parent.isDirectory() && !parent.mkdirs())
++            throw new IOException("Cannot create " + parent);
++        File tmp = new File(parent, out.getName() + ".zb-tmp");
++        try (InputStream in = zip.getInputStream(entry);
++             OutputStream stream = new FileOutputStream(tmp)) {
++            byte[] buffer = new byte[65536];
++            int read;
++            while ((read = in.read(buffer)) >= 0) {
++                if (read > 0) stream.write(buffer, 0, read);
++            }
++        }
++        if (out.exists() && !out.delete())
++            throw new IOException("Cannot replace " + out);
++        if (!tmp.renameTo(out))
++            throw new IOException("Cannot rename " + tmp + " to " + out);
++        java.nio.file.Files.write(stamp.toPath(), want.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
++    }
++}
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginClassLoader.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginClassLoader.java
+index 0e2988f..b2744da 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginClassLoader.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginClassLoader.java
+@@ -38,6 +38,16 @@ final class PluginClassLoader extends DexClassLoader {
+             if (loaded == null) {
+                 if (delegateToBridge(name)) {
+                     loaded = bridgeLoader.loadClass(name);
++                } else if (name.equals("com.prime31.IABPlugin")) {
++                    // KTB_CHEAT: the launcher's offline billing stand-in, when this build has one.
++                    try {
++                        loaded = bridgeLoader.loadClass(name);
++                    } catch (ClassNotFoundException none) {
++                        loaded = findClass(name);
++                    }
++                } else if (name.startsWith("org.apache.http.")) {
++                    // KTB37_APACHE_CLASSLOADER
++                    loaded = bridgeLoader.loadClass(name);
+                 } else if (platformClass(name)) {
+                     loaded = super.loadClass(name, false);
+                 } else {
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java
+index 75ad757..903cf98 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java
+@@ -3,6 +3,9 @@ package com.zettabridge.launcher;
+ import android.content.Context;
+ import android.content.ContextParams;
+ import android.content.ContextWrapper;
++import android.content.ServiceConnection;
++import android.content.Intent;
++import android.content.ComponentName;
+ import android.content.pm.ApplicationInfo;
+ import android.content.pm.PackageManager;
+ import android.content.res.AssetManager;
+@@ -11,6 +14,7 @@ import android.content.res.Resources;
+ import android.database.DatabaseErrorHandler;
+ import android.database.sqlite.SQLiteDatabase;
+ import android.os.Bundle;
++import android.util.Log;
+ import android.view.Display;
+ import android.view.LayoutInflater;
+ 
+@@ -136,6 +140,34 @@ final class PluginContext extends ContextWrapper {
+         return super.createPackageContext(packageName, flags);
+     }
+ 
++    // Implicit service intents. Apps written before Android 5 bind services by action alone (the
++    // Play licence check, old in-app billing); Android 5+ throws IllegalArgumentException for those.
++    // They are answered like an old device without that service: not bound, not started.
++
++    @Override
++    public boolean bindService(Intent service, ServiceConnection conn, int flags) {
++        if (implicitService(service, "bind")) return false;
++        return super.bindService(service, conn, flags);
++    }
++
++    @Override
++    public ComponentName startService(Intent service) {
++        if (implicitService(service, "start")) return null;
++        return super.startService(service);
++    }
++
++    @Override
++    public boolean stopService(Intent service) {
++        if (implicitService(service, "stop")) return false;
++        return super.stopService(service);
++    }
++
++    private static boolean implicitService(Intent service, String what) {
++        if (service == null || service.getComponent() != null || service.getPackage() != null) return false;
++        Log.w("zb-launcher", "implicit service " + what + " refused: " + service.getAction());
++        return true;
++    }
++
+     // Theme and inflater are only used when this context is not wrapped by an Activity
+     // (the plugin Application); activities have their own ContextThemeWrapper state.
+     @Override
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginStore.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginStore.java
+index 4dce9b1..adf7201 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginStore.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginStore.java
+@@ -58,10 +58,19 @@ final class PluginStore {
+     }
+ 
+     static PluginRecord importApk(Context c, Uri uri) throws IOException {
++        InputStream in = c.getContentResolver().openInputStream(uri);
++        if (in == null) throw new IOException("cannot open " + uri);
++        return importStream(c, in);
++    }
++
++    /** Imports the APK read from source, which is closed here. Used for picked files and bundled games. */
++    static PluginRecord importStream(Context c, InputStream source) throws IOException {
+         File tmp = File.createTempFile("zb-import-", ".apk", c.getCacheDir());
+-        try (InputStream in = c.getContentResolver().openInputStream(uri)) {
+-            if (in == null) throw new IOException("cannot open " + uri);
++        try (InputStream in = source) {
+             copy(in, tmp);
++        } catch (IOException e) {
++            tmp.delete();
++            throw e;
+         }
+         PackageManager pm = c.getPackageManager();
+         PackageInfo info = pm.getPackageArchiveInfo(tmp.getPath(), ARCHIVE_FLAGS);
+diff --git a/android/launcher/gradle.properties b/android/launcher/gradle.properties
+index ed2d02a..4b41305 100644
+--- a/android/launcher/gradle.properties
++++ b/android/launcher/gradle.properties
+@@ -1,3 +1,4 @@
+ org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+ android.useAndroidX=false
+ android.nonTransitiveRClass=true
++org.gradle.java.home=/usr/lib/jvm/java-17-openjdk-amd64
+diff --git a/core/android/zbproxy.c b/core/android/zbproxy.c
+index 791c9bf..5b4b943 100644
+--- a/core/android/zbproxy.c
++++ b/core/android/zbproxy.c
+@@ -168,8 +168,18 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+ // activity the guest sees. A void* first parameter is ABI-identical to the real signature, and
+ // keeps the proxy free of NDK headers so the host unit test can load it.
+ JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_state, size_t saved_state_size) {
++    // Stage21: use the NativeActivity Java object for bridge class lookup.
++    // When JNI_OnLoad has run already, this callback is called by the Android
++    // framework; FindClass without an activity loader only checks BootClassLoader.
++    struct ActivityPrefix {
++        void* callbacks;
++        JavaVM* vm;
++        JNIEnv* env;
++        jobject clazz;
++    };
++    struct ActivityPrefix* native = (struct ActivityPrefix*)activity;
+     JNIEnv* env = NULL;
+-    jobject activity_object = NULL;
++    jobject activity_object = native != NULL ? native->clazz : NULL;
+     if (g_vm != NULL && g_proxy_path[0] != 0) {
+         if ((*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK || env == NULL) {
+             log_error("%s: GetEnv(JNI_VERSION_1_6) failed in ANativeActivity_onCreate", g_proxy_path);
+@@ -178,13 +188,6 @@ JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_stat
+     } else {
+         // ANativeActivity starts with callbacks, JavaVM and JNIEnv. Android can call this entry
+         // point without calling JNI_OnLoad, so bootstrap the same proxy load from those fields.
+-        struct ActivityPrefix {
+-            void* callbacks;
+-            JavaVM* vm;
+-            JNIEnv* env;
+-            jobject clazz;
+-        };
+-        struct ActivityPrefix* native = (struct ActivityPrefix*)activity;
+         if (native == NULL || native->vm == NULL || native->env == NULL ||
+             !proxy_path(g_proxy_path, sizeof g_proxy_path)) {
+             log_error("ANativeActivity_onCreate has no VM, JNIEnv or proxy path");
+@@ -192,7 +195,6 @@ JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_stat
+         }
+         g_vm = native->vm;
+         env = native->env;
+-        activity_object = native->clazz;
+         if ((*env)->ExceptionCheck(env)) {
+             log_error("%s: exception already pending in ANativeActivity_onCreate", g_proxy_path);
+             return;
+diff --git a/core/include/zb/cp15.h b/core/include/zb/cp15.h
+index c41c28f..386fefd 100644
+--- a/core/include/zb/cp15.h
++++ b/core/include/zb/cp15.h
+@@ -2,13 +2,15 @@
+ 
+ #include <array>  // dynarmic's coprocessor.h uses std::array without including it
+ #include <cstdint>
+-#include <optional>
++#include <optional>  // zb-opt-r2: CNTVCT below
+ 
+ #include <dynarmic/interface/A32/coprocessor.h>
+ 
+ namespace zb {
+ 
+ // Minimal CP15 for user mode: only the thread ID registers used by bionic's TLS access.
++//   MRRC p15, 1, Rt, Rt2, c14   -> CNTVCT, served as CLOCK_MONOTONIC nanoseconds (zb-opt-r2;
++//                                  the guest eglGetSystemTimeNV thunk reads it)
+ //   MRC p15, 0, Rt, c13, c0, 3  -> TPIDRURO (read-only for user mode, set via __ARM_NR_set_tls)
+ //   MRC/MCR p15, 0, Rt, c13, c0, 2 -> TPIDRURW
+ class Cp15 final : public Dynarmic::A32::Coprocessor {
+diff --git a/core/include/zb/guest_memory.h b/core/include/zb/guest_memory.h
+index eb96843..c27e7b4 100644
+--- a/core/include/zb/guest_memory.h
++++ b/core/include/zb/guest_memory.h
+@@ -50,6 +50,9 @@ public:
+     // Highest free range of len bytes ending at or below limit, never below 0x10000. 0 if none.
+     std::uint32_t find_free(std::uint64_t len, std::uint32_t limit) const;
+     bool range_free(std::uint32_t addr, std::uint64_t len) const;
++    // True if any page of [addr, addr + len) is mapped executable. Translated code exists
++    // only for such pages, so changes to other ranges need no code invalidation.
++    bool any_exec(std::uint32_t addr, std::uint64_t len) const;
+ 
+     // True if every page touched by [addr, addr + len) is mapped with all `need` flags.
+     bool accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const;
+@@ -62,6 +65,9 @@ private:
+ 
+     std::uint8_t* base_ = nullptr;
+     std::vector<std::uint8_t> pages_;
++    // Mapped pages per kChunkPages-page chunk, for find_free (zb-opt-mm).
++    static constexpr std::uint32_t kChunkPages = 256;
++    std::vector<std::uint16_t> chunk_used_;
+ };
+ 
+ }  // namespace zb
+diff --git a/core/include/zb/guest_thread.h b/core/include/zb/guest_thread.h
+index a266447..cdb40e3 100644
+--- a/core/include/zb/guest_thread.h
++++ b/core/include/zb/guest_thread.h
+@@ -135,6 +135,10 @@ public:
+     std::size_t child_code_cache_size = 0;
+     // Host tid of the host thread running this guest thread.
+     std::int32_t tid = 0;
++    // Host tid interrupt() signals when it differs from `tid`. A borrower takes its carrier's tid
++    // (the identity the guest sees) but runs on the borrowing host thread; signalling `tid` would
++    // break the parked carrier's wait instead of the borrower's. 0 means "same as tid".
++    std::int32_t interrupt_tid = 0;
+ 
+     std::uint8_t MemoryRead8(std::uint32_t vaddr) override;
+     std::uint16_t MemoryRead16(std::uint32_t vaddr) override;
+@@ -149,6 +153,8 @@ public:
+     bool MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) override;
+     bool MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) override;
+     std::optional<std::uint32_t> MemoryReadCode(std::uint32_t vaddr) override;
++    // zb-opt-r2: read-only executable pages (library text and its literal pools).
++    bool IsReadOnlyMemory(std::uint32_t vaddr) override;
+     void InterpreterFallback(std::uint32_t pc, std::size_t num_instructions) override;
+     void CallSVC(std::uint32_t swi) override;
+     void ExceptionRaised(std::uint32_t pc, Dynarmic::A32::Exception exception) override;
+diff --git a/core/include/zb/host_egl.h b/core/include/zb/host_egl.h
+index 0a50c2a..e904ed1 100644
+--- a/core/include/zb/host_egl.h
++++ b/core/include/zb/host_egl.h
+@@ -151,6 +151,7 @@ public:
+         return windows_ ? windows_(handle) : nullptr;
+     }
+     std::uint32_t stub_address(const std::string& name);
++    std::uint32_t stub_address_uncached(const std::string& name);
+     std::optional<std::uint32_t> allocate_guest(std::size_t size);
+ 
+ private:
+@@ -168,6 +169,12 @@ private:
+     std::uint32_t libegl_ = 0;
+     std::uint32_t libgles_ = 0;
+     bool libegl_tried_ = false;
++    // zb-opt-egl: stub_address answers per name (0 = not found), and libraries whose guest
++    // dlopen failed, so neither is asked of the guest linker twice.
++    std::mutex stub_mutex_;
++    std::unordered_map<std::string, std::uint32_t> stub_cache_;
++    bool libegl_failed_ = false;
++    bool libgles_failed_ = false;
+ };
+ 
+ }  // namespace zb
+diff --git a/core/include/zb/library_runtime.h b/core/include/zb/library_runtime.h
+index 1fe3a1a..15cd913 100644
+--- a/core/include/zb/library_runtime.h
++++ b/core/include/zb/library_runtime.h
+@@ -58,6 +58,9 @@ public:
+     std::unique_ptr<Carrier> borrow(std::string& error);
+ 
+     GuestMemory& memory();
++    // zb-opt-r2: maps `count` ARM words as a new read+exec guest page range, for host-made
++    // guest helpers. 0 on failure.
++    std::uint32_t map_guest_code(const std::uint32_t* words, std::size_t count);
+     // Redirects guest file operations under one directory to another (Process::add_path_alias):
+     // the launcher's arm64 proxy directory stands for the plugin's arm32 libraries.
+     void add_path_alias(std::string guest_prefix, std::string host_prefix);
+diff --git a/core/include/zb/process.h b/core/include/zb/process.h
+index 9bb9ba9..97895f1 100644
+--- a/core/include/zb/process.h
++++ b/core/include/zb/process.h
+@@ -85,6 +85,12 @@ public:
+     // thread before freeing it, so the target cannot be freed between lookup and post. False if
+     // no thread has this tid.
+     bool post_signal_to(std::int32_t tid, const g::siginfo32& info);
++    // Diagnostics: one line per guest thread (borrowers first). `stuck_signal` is set when some
++    // thread has an unblocked guest signal pending; registers are a racy snapshot while a thread
++    // runs and exact while it is stopped in a syscall or host call.
++    std::vector<std::string> describe_guest_threads(bool& stuck_signal);
++    // The same for the process that installed the terminate reporter; empty when there is none.
++    static std::vector<std::string> describe_all_guest_threads(bool& stuck_signal);
+ 
+     // A JIT for the calling host thread that runs as `carrier`, a guest thread parked inside a
+     // host call: its TLS, guest tid, a stack below its sp, its signal mask, alternate signal
+diff --git a/core/include/zb/runtime_report.h b/core/include/zb/runtime_report.h
+index f1c1d89..c0b2610 100644
+--- a/core/include/zb/runtime_report.h
++++ b/core/include/zb/runtime_report.h
+@@ -196,6 +196,9 @@ private:
+     std::vector<std::pair<std::string, int>> failed_opens_;
+ 
+     std::uint64_t gl_call_total_ = 0;
++    // zb-opt-r2: GL calls after the first are only counted, without the mutex or the writer.
++    std::atomic<bool> gl_calls_seen_{false};
++    std::atomic<std::uint64_t> gl_calls_extra_{0};
+     std::string gl_first_call_function_;
+     std::uint64_t gl_first_call_tid_ = 0;
+     bool gl_egl_context_known_ = false;
+@@ -212,7 +215,7 @@ private:
+     std::vector<std::pair<std::string, std::string>> crash_details_;
+     static constexpr std::size_t kMaxJniDetails = 16;
+     std::vector<std::pair<std::string, std::string>> jni_details_;
+-    static constexpr std::size_t kMaxWatchDetails = 8;
++    static constexpr std::size_t kMaxWatchDetails = 32;
+     std::vector<std::pair<std::string, std::string>> watch_details_;
+     static constexpr std::size_t kMaxLooperDetails = 16;
+     std::vector<std::pair<std::string, std::string>> looper_details_;
+diff --git a/core/src/assets/host_assets.cpp b/core/src/assets/host_assets.cpp
+index 0845597..4fd70fa 100644
+--- a/core/src/assets/host_assets.cpp
++++ b/core/src/assets/host_assets.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <unistd.h>
+ 
++#include <atomic>
+ #include <cstring>
+ #include <limits>
+ #include <optional>
+@@ -11,6 +12,7 @@
+ #include "zb/guest_memory.h"
+ #include "zb/host_jni.h"
+ #include "zb/log.h"
++#include "zb/runtime_report.h"
+ 
+ namespace zb {
+ 
+@@ -99,12 +101,34 @@ bool HostAssets::handle_host_call(std::uint32_t index, GuestThread& thread) {
+         return true;
+     }
+     case ZB_ASSET_HC_AAssetManager_open: {
+-        const std::uint64_t manager = require_manager(regs[0]);
++        const std::uint32_t guest_manager = regs[0];
++        const std::uint64_t manager = require_manager(guest_manager);
+         bool ok = false;
+         std::string filename;
+         if (manager != 0) filename = read_guest_string(runtime_.memory(), regs[1], ok);
+         std::uint64_t asset = 0;
+-        if (manager != 0 && ok) asset = backend_.open(manager, filename, static_cast<std::int32_t>(regs[2]));
++        const int mode = static_cast<std::int32_t>(regs[2]);
++        if (manager != 0 && ok) asset = backend_.open(manager, filename, mode);
++
++        // Stage 33: legacy Unity sometimes passes an absolute APK asset path
++        // (or "assets/..."), whereas NDK AAssetManager_open requires a path
++        // relative to the APK's assets/ directory. Retry ONLY managed DLLs.
++        std::string alternate;
++        if (asset == 0 && manager != 0 && ok) {
++            constexpr const char* marker = "/assets/";
++            const std::size_t pos = filename.rfind(marker);
++            if (pos != std::string::npos) {
++                alternate = filename.substr(pos + std::strlen(marker));
++            } else if (filename.compare(0, 7, "assets/") == 0) {
++                alternate = filename.substr(7);
++            }
++            if (alternate.compare(0, 17, "bin/Data/Managed/") == 0 &&
++                alternate != filename) {
++                asset = backend_.open(manager, alternate, mode);
++            } else {
++                alternate.clear();
++            }
++        }
+         regs[0] = asset == 0 ? 0 : assets_.add(asset);
+         return true;
+     }
+diff --git a/core/src/cp15.cpp b/core/src/cp15.cpp
+index f4b5290..711dddb 100644
+--- a/core/src/cp15.cpp
++++ b/core/src/cp15.cpp
+@@ -1,4 +1,5 @@
+ #include <atomic>
++#include <ctime>
+ #include "zb/cp15.h"
+ 
+ namespace zb {
+@@ -18,6 +19,14 @@ bool is_barrier(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned
+     return CRm == CoprocReg::C5 && opc2 == 4;                            // ISB
+ }
+ 
++// zb-opt-r2: CNTVCT as monotonic nanoseconds. A coprocessor callback runs inline in translated
++// code, so reading the time costs no exit from the JIT (a syscall does).
++std::uint64_t read_counter_ns(void*, std::uint32_t, std::uint32_t) {
++    timespec ts{};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(ts.tv_nsec);
++}
++
+ std::uint64_t run_barrier(void*, std::uint32_t, std::uint32_t) {
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     return 0;
+@@ -51,7 +60,8 @@ Cp15::CallbackOrAccessOneWord Cp15::CompileGetOneWord(bool two, unsigned opc1, C
+     return std::monostate{};
+ }
+ 
+-Cp15::CallbackOrAccessTwoWords Cp15::CompileGetTwoWords(bool, unsigned, CoprocReg) {
++Cp15::CallbackOrAccessTwoWords Cp15::CompileGetTwoWords(bool two, unsigned opc, CoprocReg CRm) {
++    if (!two && opc == 1 && CRm == CoprocReg::C14) return Callback{&read_counter_ns, std::nullopt};
+     return std::monostate{};
+ }
+ 
+diff --git a/core/src/gen/gl_dispatch.inc b/core/src/gen/gl_dispatch.inc
+index dbc5c9e..54bbc7d 100644
+--- a/core/src/gen/gl_dispatch.inc
++++ b/core/src/gen/gl_dispatch.inc
+@@ -151,17 +151,7 @@ bool HostGl::dispatch(Call& call) {
+         return true;
+     }
+     case ZB_GL_HC_glCompressedTexImage2D: {
+-        const GLenum target = call.scalar<GLenum>(0);
+-        const GLint level = call.scalar<GLint>(1);
+-        const GLenum internalformat = call.scalar<GLenum>(2);
+-        const GLsizei width = call.scalar<GLsizei>(3);
+-        const GLsizei height = call.scalar<GLsizei>(4);
+-        const GLint border = call.scalar<GLint>(5);
+-        const GLsizei imageSize = call.scalar<GLsizei>(6);
+-        const void * data = call.pointer<const void>(7, call.length(imageSize, 1u), kPageRead);
+-        if (!call.valid()) return true;
+-        backend_.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+-        return true;
++        return zbgl_manual_glCompressedTexImage2D(*this, call);
+     }
+     case ZB_GL_HC_glCompressedTexSubImage2D: {
+         const GLenum target = call.scalar<GLenum>(0);
+diff --git a/core/src/gen/gl_manual.inc b/core/src/gen/gl_manual.inc
+index c29ea86..aaf776e 100644
+--- a/core/src/gen/gl_manual.inc
++++ b/core/src/gen/gl_manual.inc
+@@ -13,6 +13,7 @@ bool zbgl_manual_glGetUniformiv(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glGetVertexAttribPointerv(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glReadPixels(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glShaderSource(HostGl& host, HostGl::Call& call);
++bool zbgl_manual_glCompressedTexImage2D(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glTexImage2D(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glTexSubImage2D(HostGl& host, HostGl::Call& call);
+ bool zbgl_manual_glVertexAttribPointer(HostGl& host, HostGl::Call& call);
+diff --git a/core/src/gl/gl_manual.cpp b/core/src/gl/gl_manual.cpp
+index fc48548..bbf083b 100644
+--- a/core/src/gl/gl_manual.cpp
++++ b/core/src/gl/gl_manual.cpp
+@@ -1,6 +1,7 @@
+ #include "zb/host_gl.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
+@@ -98,7 +99,7 @@ GlThreadState& state(const HostGl& host) {
+ 
+ // The driver's extensions this bridge can serve, in the order the driver lists them. GLES 3.0
+ // enumerates them one by one; a GLES 2.0 context has only the single space-separated string.
+-const std::vector<std::string>& served_extensions(HostGl& host) {
++const std::vector<std::string>& served_extensions_driver(HostGl& host) {
+     GlThreadState& current = state(host);
+     if (current.extensions_known) return current.extensions;
+     current.extensions_known = true;
+@@ -127,6 +128,220 @@ const std::vector<std::string>& served_extensions(HostGl& host) {
+     return current.extensions;
+ }
+ 
++// ---- zb-pvrtc: PVRTC1 (GL_IMG_texture_compression_pvrtc) decoding -------------------------------
++// The GPU of current phones has no PVRTC. Games cooked only for PowerVR (World War Z) get the
++// extension from glGetString and their PVRTC uploads are decoded here to RGBA8. Follows the
++// reference decompressor of the PVRTC1 format (PowerVR SDK, PVRTDecompress).
++namespace pvrtc {
++
++struct Pixel32 { std::uint8_t r, g, b, a; };
++struct Pixel128 { std::int32_t r, g, b, a; };
++struct Word { std::uint32_t modulation, color; };
++
++inline Pixel32 color_a(std::uint32_t c) {
++    if (c & 0x8000u) {
++        return {std::uint8_t((c & 0x7c00u) >> 10), std::uint8_t((c & 0x3e0u) >> 5),
++                std::uint8_t((c & 0x1eu) | ((c & 0x1eu) >> 4)), 0xf};
++    }
++    return {std::uint8_t(((c & 0xf00u) >> 7) | ((c & 0xf00u) >> 11)),
++            std::uint8_t(((c & 0xf0u) >> 3) | ((c & 0xf0u) >> 7)),
++            std::uint8_t(((c & 0xeu) << 1) | ((c & 0xeu) >> 2)), std::uint8_t((c & 0x7000u) >> 11)};
++}
++
++inline Pixel32 color_b(std::uint32_t c) {
++    if (c & 0x80000000u) {
++        return {std::uint8_t((c & 0x7c000000u) >> 26), std::uint8_t((c & 0x3e00000u) >> 21),
++                std::uint8_t((c & 0x1f0000u) >> 16), 0xf};
++    }
++    return {std::uint8_t(((c & 0xf000000u) >> 23) | ((c & 0xf000000u) >> 27)),
++            std::uint8_t(((c & 0xf00000u) >> 19) | ((c & 0xf00000u) >> 23)),
++            std::uint8_t(((c & 0xf0000u) >> 15) | ((c & 0xf0000u) >> 19)),
++            std::uint8_t((c & 0x70000000u) >> 27)};
++}
++
++inline void interpolate(Pixel32 P, Pixel32 Q, Pixel32 R, Pixel32 S, Pixel128* out, int bpp) {
++    const int ww = bpp == 2 ? 8 : 4, wh = 4;
++    Pixel128 hp{P.r, P.g, P.b, P.a}, hq{Q.r, Q.g, Q.b, Q.a}, hr{R.r, R.g, R.b, R.a}, hs{S.r, S.g, S.b, S.a};
++    const Pixel128 qp{hq.r - hp.r, hq.g - hp.g, hq.b - hp.b, hq.a - hp.a};
++    const Pixel128 sr{hs.r - hr.r, hs.g - hr.g, hs.b - hr.b, hs.a - hr.a};
++    hp = {hp.r * ww, hp.g * ww, hp.b * ww, hp.a * ww};
++    hr = {hr.r * ww, hr.g * ww, hr.b * ww, hr.a * ww};
++    for (int x = 0; x < ww; ++x) {
++        Pixel128 res{4 * hp.r, 4 * hp.g, 4 * hp.b, 4 * hp.a};
++        const Pixel128 dy{hr.r - hp.r, hr.g - hp.g, hr.b - hp.b, hr.a - hp.a};
++        for (int y = 0; y < wh; ++y) {
++            Pixel128& o = out[y * ww + x];
++            // res = ww * wh * value: 5-bit colour and 4-bit alpha, widened to 8 bits by bit replication.
++            if (bpp == 4) {
++                o.r = (res.r >> 1) + (res.r >> 6); o.g = (res.g >> 1) + (res.g >> 6); o.b = (res.b >> 1) + (res.b >> 6);
++                o.a = res.a + (res.a >> 4);
++            } else {
++                o.r = (res.r >> 2) + (res.r >> 7); o.g = (res.g >> 2) + (res.g >> 7); o.b = (res.b >> 2) + (res.b >> 7);
++                o.a = (res.a >> 1) + (res.a >> 5);
++            }
++            res.r += dy.r; res.g += dy.g; res.b += dy.b; res.a += dy.a;
++        }
++        hp.r += qp.r; hp.g += qp.g; hp.b += qp.b; hp.a += qp.a;
++        hr.r += sr.r; hr.g += sr.g; hr.b += sr.b; hr.a += sr.a;
++    }
++}
++
++inline void unpack_modulations(const Word& w, int ox, int oy, std::int32_t values[16][8], std::int32_t modes[16][8], int bpp) {
++    std::uint32_t mode = w.color & 1u;
++    std::uint32_t bits = w.modulation;
++    if (bpp == 2) {
++        if (mode) {
++            if (bits & 1u) {
++                mode = (bits & (1u << 20)) ? 3 : 2;
++                if (bits & (1u << 21)) bits |= (1u << 20); else bits &= ~(1u << 20);
++            }
++            if (bits & 2u) bits |= 1u; else bits &= ~1u;
++            for (int y = 0; y < 4; ++y)
++                for (int x = 0; x < 8; ++x) {
++                    modes[x + ox][y + oy] = std::int32_t(mode);
++                    if (((x ^ y) & 1) == 0) { values[x + ox][y + oy] = std::int32_t(bits & 3u); bits >>= 2; }
++                }
++        } else {
++            for (int y = 0; y < 4; ++y)
++                for (int x = 0; x < 8; ++x) {
++                    modes[x + ox][y + oy] = std::int32_t(mode);
++                    values[x + ox][y + oy] = (bits & 1u) ? 3 : 0;
++                    bits >>= 1;
++                }
++        }
++    } else {
++        for (int y = 0; y < 4; ++y)
++            for (int x = 0; x < 4; ++x) {
++                modes[x + ox][y + oy] = std::int32_t(mode);
++                std::int32_t v = std::int32_t(bits & 3u);
++                if (mode) { if (v == 1) v = 4; else if (v == 2) v = 14; else if (v == 3) v = 8; }
++                else { v *= 3; if (v > 3) v -= 1; }
++                values[x + ox][y + oy] = v;
++                bits >>= 2;
++            }
++    }
++}
++
++inline std::int32_t modulation(std::int32_t values[16][8], std::int32_t modes[16][8], int x, int y, int bpp) {
++    if (bpp == 4) return values[x][y];
++    static constexpr std::int32_t rep[4] = {0, 3, 5, 8};
++    if (modes[x][y] == 0 || ((x ^ y) & 1) == 0) return rep[values[x][y]];
++    if (modes[x][y] == 1)
++        return (rep[values[x][y - 1]] + rep[values[x][y + 1]] + rep[values[x - 1][y]] + rep[values[x + 1][y]] + 2) / 4;
++    if (modes[x][y] == 2) return (rep[values[x - 1][y]] + rep[values[x + 1][y]] + 1) / 2;
++    return (rep[values[x][y - 1]] + rep[values[x][y + 1]] + 1) / 2;
++}
++
++inline std::uint32_t twiddle(std::uint32_t ysize, std::uint32_t xsize, std::uint32_t y, std::uint32_t x) {
++    std::uint32_t out = 0, min_dim = xsize, max_value = y, src = 1, dst = 1, shift = 0;
++    if (ysize < xsize) { min_dim = ysize; max_value = x; }
++    while (src < min_dim) {
++        if (y & src) out |= dst;
++        if (x & src) out |= dst << 1;
++        src <<= 1; dst <<= 2; ++shift;
++    }
++    return out | ((max_value >> shift) << (2 * shift));
++}
++
++// Size of the compressed data of one image (GL_IMG_texture_compression_pvrtc).
++inline std::size_t data_size(int width, int height, int bpp) {
++    const std::size_t w = std::size_t(std::max(width, bpp == 2 ? 16 : 8));
++    const std::size_t h = std::size_t(std::max(height, 8));
++    return w * h * std::size_t(bpp) / 8;
++}
++
++// Decodes to tightly packed RGBA8, width x height.
++inline void decode(const std::uint8_t* src, int width, int height, int bpp, bool opaque, std::uint8_t* rgba) {
++    const int ww = bpp == 2 ? 8 : 4, wh = 4;
++    const int xdim = std::max(width, bpp == 2 ? 16 : 8), ydim = std::max(height, 8);
++    const int nx = xdim / ww, ny = ydim / wh;
++    std::vector<Pixel32> full(std::size_t(xdim) * std::size_t(ydim));
++    std::int32_t values[16][8], modes[16][8];
++    Pixel128 ua[32], ub[32];
++    auto word = [&](int wy, int wx) {
++        const std::uint8_t* p = src + 8u * twiddle(std::uint32_t(ny), std::uint32_t(nx), std::uint32_t(wy), std::uint32_t(wx));
++        Word w;
++        std::memcpy(&w.modulation, p, 4);
++        std::memcpy(&w.color, p + 4, 4);
++        return w;
++    };
++    for (int wy = -1; wy < ny - 1; ++wy) {
++        for (int wx = -1; wx < nx - 1; ++wx) {
++            const int py = (wy + ny) % ny, px = (wx + nx) % nx, ry = (wy + 1) % ny, qx = (wx + 1) % nx;
++            const Word P = word(py, px), Q = word(py, qx), R = word(ry, px), S = word(ry, qx);
++            unpack_modulations(P, 0, 0, values, modes, bpp);
++            unpack_modulations(Q, ww, 0, values, modes, bpp);
++            unpack_modulations(R, 0, wh, values, modes, bpp);
++            unpack_modulations(S, ww, wh, values, modes, bpp);
++            interpolate(color_a(P.color), color_a(Q.color), color_a(R.color), color_a(S.color), ua, bpp);
++            interpolate(color_b(P.color), color_b(Q.color), color_b(R.color), color_b(S.color), ub, bpp);
++            Pixel32 block[32];
++            for (int y = 0; y < wh; ++y)
++                for (int x = 0; x < ww; ++x) {
++                    std::int32_t m = modulation(values, modes, x + ww / 2, y + wh / 2, bpp);
++                    bool punch = false;
++                    if (m > 10) { punch = true; m -= 10; }
++                    const Pixel128& a = ua[y * ww + x];
++                    const Pixel128& b = ub[y * ww + x];
++                    Pixel32& o = block[y * ww + x];
++                    o.r = std::uint8_t((a.r * (8 - m) + b.r * m) / 8);
++                    o.g = std::uint8_t((a.g * (8 - m) + b.g * m) / 8);
++                    o.b = std::uint8_t((a.b * (8 - m) + b.b * m) / 8);
++                    o.a = punch ? 0 : std::uint8_t((a.a * (8 - m) + b.a * m) / 8);
++                }
++            for (int y = 0; y < wh / 2; ++y)
++                for (int x = 0; x < ww / 2; ++x) {
++                    full[std::size_t((py * wh + y + wh / 2) * xdim + px * ww + x + ww / 2)] = block[y * ww + x];
++                    full[std::size_t((py * wh + y + wh / 2) * xdim + qx * ww + x)] = block[y * ww + x + ww / 2];
++                    full[std::size_t((ry * wh + y) * xdim + px * ww + x + ww / 2)] = block[(y + wh / 2) * ww + x];
++                    full[std::size_t((ry * wh + y) * xdim + qx * ww + x)] = block[(y + wh / 2) * ww + x + ww / 2];
++                }
++        }
++    }
++    for (int y = 0; y < height; ++y)
++        for (int x = 0; x < width; ++x) {
++            const Pixel32& p = full[std::size_t(y * xdim + x)];
++            std::uint8_t* o = rgba + 4 * (std::size_t(y) * std::size_t(width) + std::size_t(x));
++            o[0] = p.r; o[1] = p.g; o[2] = p.b; o[3] = opaque ? 0xff : p.a;
++        }
++}
++
++}  // namespace pvrtc
++
++// zb-pvrtc: the World War Z app (process com.zettabridge.wwz...) gets PVRTC instead of the
++// formats its data was not cooked for. Other games see the driver's list unchanged.
++bool pvrtc_emulation() {
++    static const bool enabled = [] {
++        char name[128] = {};
++        FILE* f = std::fopen("/proc/self/cmdline", "rb");
++        if (f == nullptr) return false;
++        const std::size_t n = std::fread(name, 1, sizeof(name) - 1, f);
++        std::fclose(f);
++        name[n] = 0;
++        return std::strncmp(name, "com.zettabridge.wwz", 19) == 0;
++    }();
++    return enabled;
++}
++
++const std::vector<std::string>& served_extensions(HostGl& host) {
++    const std::vector<std::string>& driver = served_extensions_driver(host);
++    if (!pvrtc_emulation()) return driver;
++    static constexpr std::string_view kPvrtc = "GL_IMG_texture_compression_pvrtc";
++    if (std::find(driver.begin(), driver.end(), kPvrtc) != driver.end()) return driver;
++    static constexpr std::string_view kHidden[] = {
++        "GL_OES_compressed_ETC1_RGB8_texture", "GL_AMD_compressed_ATC_texture",
++        "GL_ATI_texture_compression_atitc", "GL_EXT_texture_compression_s3tc",
++        "GL_EXT_texture_compression_dxt1", "GL_OES_texture_compression_astc",
++        "GL_KHR_texture_compression_astc_ldr", "GL_KHR_texture_compression_astc_hdr",
++        "GL_EXT_texture_compression_s3tc_srgb"};
++    auto& list = const_cast<std::vector<std::string>&>(driver);
++    list.erase(std::remove_if(list.begin(), list.end(), [](const std::string& e) {
++        return std::find(std::begin(kHidden), std::end(kHidden), e) != std::end(kHidden);
++    }), list.end());
++    list.emplace_back(kPvrtc);
++    return driver;
++}
++
+ // Copies a host string into guest memory and answers the call with its guest address.
+ std::uint32_t answer_with_string(HostGl& host, HostGl::Call& call, std::string_view text) {
+     const auto address = host.allocate_guest(text.size() + 1);
+@@ -690,10 +905,15 @@ bool zbgl_manual_glGetString(HostGl& host, HostGl::Call& call) {
+     }
+     if (name == kGlExtensions) {
+         std::string served;
++        // Space after every name, the last one too: drivers do it, and engines search for
++        // " NAME " (Unreal Engine 3 misses the last extension otherwise).
+         for (const std::string& extension : served_extensions(host)) {
+-            if (!served.empty()) served.push_back(' ');
+             served += extension;
++            served.push_back(' ');
+         }
++        // zb-wwz-diag
++        log("wwz-gl: GL_EXTENSIONS %zu bytes, tail '%s'", served.size(),
++            served.substr(served.size() > 90 ? served.size() - 90 : 0).c_str());
+         if (const std::uint32_t address = answer_with_string(host, call, served)) current.strings[name] = address;
+         return true;
+     }
+@@ -1536,4 +1756,36 @@ bool zbgl_manual_glGetSynciv(HostGl& host, HostGl::Call& call) {
+ 
+ #undef ZB_GL_STUB
+ 
++
++// zb-pvrtc: PVRTC uploads are decoded to RGBA8 (see pvrtc_emulation); everything else goes to the
++// driver unchanged, exactly as the generated entry did.
++bool zbgl_manual_glCompressedTexImage2D(HostGl& host, HostGl::Call& call) {
++    const GLenum target = call.scalar<GLenum>(0);
++    const GLint level = call.scalar<GLint>(1);
++    const GLenum internalformat = call.scalar<GLenum>(2);
++    const GLsizei width = call.scalar<GLsizei>(3);
++    const GLsizei height = call.scalar<GLsizei>(4);
++    const GLint border = call.scalar<GLint>(5);
++    const GLsizei imageSize = call.scalar<GLsizei>(6);
++    const void* data = call.pointer<const void>(7, call.length(imageSize, 1u), kPageRead);
++    if (!call.valid()) return true;
++    GlThreadState& current = state(host);
++    if (internalformat >= 0x8C00 && internalformat <= 0x8C03 && width > 0 && height > 0 &&
++        data != nullptr && current.pixel_unpack_buffer == 0) {
++        const int bpp = (internalformat == 0x8C01 || internalformat == 0x8C03) ? 2 : 4;
++        if (static_cast<std::size_t>(imageSize) >= pvrtc::data_size(width, height, bpp)) {
++            std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u);
++            pvrtc::decode(static_cast<const std::uint8_t*>(data), width, height, bpp,
++                          internalformat <= 0x8C01, rgba.data());
++            if (current.unpack_alignment != 4) host.backend().glPixelStorei(kGlUnpackAlignment, 4);
++            host.backend().glTexImage2D(target, level, 0x1908 /* GL_RGBA */, width, height, border,
++                                        0x1908, 0x1401 /* GL_UNSIGNED_BYTE */, rgba.data());
++            if (current.unpack_alignment != 4) host.backend().glPixelStorei(kGlUnpackAlignment, current.unpack_alignment);
++            return true;
++        }
++    }
++    host.backend().glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
++    return true;
++}
++
+ }  // namespace zb
+diff --git a/core/src/gl/host_egl.cpp b/core/src/gl/host_egl.cpp
+index 686ed0c..e61c3dc 100644
+--- a/core/src/gl/host_egl.cpp
++++ b/core/src/gl/host_egl.cpp
+@@ -3,6 +3,7 @@
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+@@ -159,6 +160,29 @@ std::optional<const void*> HostEgl::lookup(std::uint32_t handle, EglObject kind)
+ 
+ std::uint32_t HostEgl::stub_address(const std::string& name) {
+     if (stubs_) return stubs_(name);
++    // zb-opt-egl: answer repeated lookups from the cache.
++    std::lock_guard<std::mutex> stub_lock(stub_mutex_);
++    if (const auto it = stub_cache_.find(name); it != stub_cache_.end()) return it->second;
++    const std::uint32_t found = stub_address_uncached(name);
++    stub_cache_.emplace(name, found);
++    return found;
++}
++
++std::uint32_t HostEgl::stub_address_uncached(const std::string& name) {
++    // zb-opt-r2: EGL_NV_system_time as guest thunks (see cp15.cpp). Unity 4's timer asks for
++    // these on every time query until it gets them, then reads the time with no host call.
++    if (name == "eglGetSystemTimeNV" || name == "eglGetSystemTimeFrequencyNV") {
++        static const std::uint32_t kThunks[] = {
++            0xEC510F1Eu,  // +0  eglGetSystemTimeNV:          mrrc p15, 1, r0, r1, c14
++            0xE12FFF1Eu,  // +4                                bx lr
++            0xE59F0004u,  // +8  eglGetSystemTimeFrequencyNV: ldr r0, [pc, #4]
++            0xE3A01000u,  // +12                               mov r1, #0
++            0xE12FFF1Eu,  // +16                               bx lr
++            1000000000u,  // +20 nanoseconds
++        };
++        static const std::uint32_t base = runtime_.map_guest_code(kThunks, sizeof kThunks / sizeof kThunks[0]);
++        if (base != 0) return name == "eglGetSystemTimeNV" ? base : base + 8;
++    }
+     // Any guest library already loaded, which covers gl* in libGLESv2.so as well as egl*: Skia and
+     // Impeller resolve every GL entry point through eglGetProcAddress, so an EGL-only lookup left
+     // them without a single GL function.
+@@ -166,11 +190,15 @@ std::uint32_t HostEgl::stub_address(const std::string& name) {
+     const std::uint32_t global = runtime_.find_symbol(ZB_GUEST_RTLD_DEFAULT, name, error);
+     if (global != 0) return global;
+     for (const char* library : {"libEGL.so", "libGLESv2.so"}) {
+-        std::uint32_t& handle = std::strcmp(library, "libEGL.so") == 0 ? libegl_ : libgles_;
++        const bool egl = std::strcmp(library, "libEGL.so") == 0;
++        std::uint32_t& handle = egl ? libegl_ : libgles_;
++        bool& failed = egl ? libegl_failed_ : libgles_failed_;
+         if (handle == 0) {
++            if (failed) continue;
+             std::string load_error;
+             handle = runtime_.load_library(library, ZB_GUEST_RTLD_NOW, load_error);
+             if (handle == 0) {
++                failed = true;
+                 log("eglGetProcAddress: guest %s is not loadable: %s", library, load_error.c_str());
+                 continue;
+             }
+diff --git a/core/src/gl/host_gl.cpp b/core/src/gl/host_gl.cpp
+index a8cf6f8..0d0f58e 100644
+--- a/core/src/gl/host_gl.cpp
++++ b/core/src/gl/host_gl.cpp
+@@ -87,7 +87,8 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
+         log("GLES trace: %s(0x%x, 0x%x, 0x%x, 0x%x)", name, thread.regs()[0], thread.regs()[1],
+             thread.regs()[2], thread.regs()[3]);
+     }
+-    const std::uint64_t host_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
++    // zb-opt-r2: one gettid per host thread, not one per GL call.
++    static thread_local const std::uint64_t host_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+     runtime_report().note_gl_call(name, host_tid);
+     const std::uint64_t egl_generation = runtime_report().egl_current_generation();
+     if (egl_generation != gl_thread_sampled_generation_) {
+@@ -100,6 +101,7 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
+     }
+     Call call(*this, thread, index);
+     if (gl_diagnostics_enabled()) gl_diagnose_before(*this, call);
++
+     if (dispatch(call)) {
+         // Visibility diagnostics query the driver, so they run only once the Android runtime
+         // enables them; mock-backend tests keep exact call logs.
+diff --git a/core/src/guest_memory.cpp b/core/src/guest_memory.cpp
+index 1aa42ea..350463b 100644
+--- a/core/src/guest_memory.cpp
++++ b/core/src/guest_memory.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <sys/mman.h>
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cstring>
+ 
+@@ -35,7 +36,9 @@ int host_prot(int guest_prot) {
+     return p;
+ }
+ 
+-GuestMemory::GuestMemory() : pages_(static_cast<std::size_t>(kGuestSpaceSize >> 12), 0) {
++GuestMemory::GuestMemory()
++    : pages_(static_cast<std::size_t>(kGuestSpaceSize >> 12), 0),
++      chunk_used_(static_cast<std::size_t>((kGuestSpaceSize >> 12) / kChunkPages), 0) {
+     void* p = mmap(nullptr, kGuestSpaceSize + kGuardSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+     if (p == MAP_FAILED) {
+         log("cannot reserve guest address space: %s", std::strerror(errno));
+@@ -49,7 +52,22 @@ GuestMemory::~GuestMemory() {
+ }
+ 
+ void GuestMemory::set_flags(std::uint32_t addr, std::uint64_t len, std::uint8_t flags) {
+-    std::memset(pages_.data() + (addr >> 12), flags, static_cast<std::size_t>(page_round_up(len) >> 12));
++    const std::uint64_t first = addr >> 12;
++    const std::uint64_t end = first + (page_round_up(len) >> 12);
++    // zb-opt-mm: keep the per-chunk mapped-page counts in step with the page table.
++    for (std::uint64_t i = first; i < end;) {
++        const std::uint64_t chunk = i / kChunkPages;
++        const std::uint64_t stop = std::min<std::uint64_t>(end, (chunk + 1) * kChunkPages);
++        int delta = 0;
++        for (std::uint64_t j = i; j < stop; ++j) {
++            const bool was = pages_[j] != 0;
++            const bool now = flags != 0;
++            delta += static_cast<int>(now) - static_cast<int>(was);
++        }
++        chunk_used_[chunk] = static_cast<std::uint16_t>(static_cast<int>(chunk_used_[chunk]) + delta);
++        i = stop;
++    }
++    std::memset(pages_.data() + first, flags, static_cast<std::size_t>(end - first));
+ }
+ 
+ bool GuestMemory::map_anon(std::uint32_t addr, std::uint64_t len, int prot) {
+@@ -92,8 +110,43 @@ std::uint32_t GuestMemory::find_free(std::uint64_t len, std::uint32_t limit) con
+     const std::uint64_t pages = page_round_up(len) >> 12;
+     const std::uint64_t top = limit >> 12;
+     if (pages == 0 || top < kLowestAllocPage || top - kLowestAllocPage < pages) return 0;
++    // Walks down from the top like the plain page scan, but a chunk boundary lets it step over
++    // a whole fully mapped or fully free chunk at once (zb-opt-mm). Same result as before.
+     std::uint64_t run = 0;
+-    for (std::uint64_t i = top; i-- > kLowestAllocPage;) {
++    std::uint64_t i = top;  // pages [i, i + run) are free
++    while (i > kLowestAllocPage) {
++        if (i % kChunkPages == 0 && i - kChunkPages >= kLowestAllocPage) {
++            const std::uint16_t used = chunk_used_[i / kChunkPages - 1];
++            if (used == kChunkPages) {
++                run = 0;
++                i -= kChunkPages;
++                continue;
++            }
++            if (used == 0) {
++                if (run + kChunkPages >= pages) return static_cast<std::uint32_t>((i - (pages - run)) << 12);
++                run += kChunkPages;
++                i -= kChunkPages;
++                continue;
++            }
++        }
++        // zb-opt-mm2: eight flag bytes at once; all free extends the run, all mapped resets it.
++        if (i % 8 == 0 && i - 8 >= kLowestAllocPage) {
++            std::uint64_t w;
++            std::memcpy(&w, pages_.data() + (i - 8), sizeof w);
++            if (w == 0) {
++                if (run + 8 >= pages) return static_cast<std::uint32_t>((i - (pages - run)) << 12);
++                run += 8;
++                i -= 8;
++                continue;
++            }
++            constexpr std::uint64_t kOnes = 0x0101010101010101ULL, kHigh = 0x8080808080808080ULL;
++            if (((w - kOnes) & ~w & kHigh) == 0) {  // no zero byte: all eight pages mapped
++                run = 0;
++                i -= 8;
++                continue;
++            }
++        }
++        --i;
+         if (pages_[i] == 0) {
+             if (++run == pages) return static_cast<std::uint32_t>(i << 12);
+         } else {
+@@ -112,6 +165,15 @@ bool GuestMemory::range_free(std::uint32_t addr, std::uint64_t len) const {
+     return true;
+ }
+ 
++bool GuestMemory::any_exec(std::uint32_t addr, std::uint64_t len) const {
++    if (len == 0) return false;
++    const std::uint64_t end = std::min<std::uint64_t>(static_cast<std::uint64_t>(addr) + len, kGuestSpaceSize);
++    for (std::uint64_t i = addr >> 12, last = (end - 1) >> 12; i <= last; ++i) {
++        if (pages_[i] & kPageExec) return true;
++    }
++    return false;
++}
++
+ bool GuestMemory::accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const {
+     if (len == 0) return true;
+     const std::uint64_t end = static_cast<std::uint64_t>(addr) + len;
+diff --git a/core/src/guest_thread.cpp b/core/src/guest_thread.cpp
+index 49d0852..96ca8ca 100644
+--- a/core/src/guest_thread.cpp
++++ b/core/src/guest_thread.cpp
+@@ -4,8 +4,10 @@
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
++#include <atomic>
+ #include <bit>
+ #include <climits>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <dynarmic/interface/exclusive_monitor.h>
+@@ -43,6 +45,21 @@ void store(std::uint8_t* p, T v) {
+     std::memcpy(p, &v, sizeof v);
+ }
+ 
++// Guest store-exclusive as one host atomic compare-and-swap. The ExclusiveMonitor lock only orders
++// exclusive writes among themselves; plain guest stores do not take it, so a compare followed by a
++// separate write could overwrite a concurrent plain store (a lock release) and lose it. Naturally
++// aligned accesses (all the architecture allows for LDREX/STREX) use the CAS; a misaligned one
++// keeps the old path, as the hardware would have faulted anyway.
++template <typename T>
++bool host_cas(std::uint8_t* p, T value, T expected) {
++    if (reinterpret_cast<std::uintptr_t>(p) % std::atomic_ref<T>::required_alignment != 0) {
++        if (load<T>(p) != expected) return false;
++        store(p, value);
++        return true;
++    }
++    return std::atomic_ref<T>(*reinterpret_cast<T*>(p)).compare_exchange_strong(expected, value, std::memory_order_seq_cst);
++}
++
+ }  // namespace
+ 
+ GuestThread::GuestThread(GuestMemory& mem, Dynarmic::ExclusiveMonitor* monitor, std::size_t processor_id,
+@@ -202,8 +219,9 @@ void GuestThread::end_blocking() {
+ void GuestThread::interrupt() {
+     // seq_cst: the poster sets the pending bit before reading this flag, and the waiter sets the
+     // flag before it checks for pending signals, so at least one of the two sees the other.
+-    if (blocking_.load() == 0 || tid == 0) return;
+-    ::syscall(SYS_tgkill, ::getpid(), tid, host_interrupt_signal());
++    const std::int32_t target = interrupt_tid != 0 ? interrupt_tid : tid;
++    if (blocking_.load() == 0 || target == 0) return;
++    ::syscall(SYS_tgkill, ::getpid(), target, host_interrupt_signal());
+ }
+ 
+ void GuestThread::post_signal(const g::siginfo32& info) {
+@@ -285,29 +303,33 @@ void GuestThread::MemoryWrite64(std::uint32_t vaddr, std::uint64_t value) {
+     if (check_access(vaddr, 8, kPageWrite, true)) store(mem_.base() + vaddr, value);
+ }
+ 
+-// The ExclusiveMonitor serializes these calls; compare-then-write is atomic under its lock.
++// The ExclusiveMonitor serializes these calls; host_cas makes each one atomic against plain stores.
+ bool GuestThread::MemoryWriteExclusive8(std::uint32_t vaddr, std::uint8_t value, std::uint8_t expected) {
+-    if (!check_access(vaddr, 1, kPageRead | kPageWrite, true) || mem_.base()[vaddr] != expected) return false;
+-    mem_.base()[vaddr] = value;
+-    return true;
++    if (!check_access(vaddr, 1, kPageRead | kPageWrite, true)) return false;
++    return host_cas<std::uint8_t>(mem_.base() + vaddr, value, expected);
+ }
+ 
+ bool GuestThread::MemoryWriteExclusive16(std::uint32_t vaddr, std::uint16_t value, std::uint16_t expected) {
+-    if (!check_access(vaddr, 2, kPageRead | kPageWrite, true) || load<std::uint16_t>(mem_.base() + vaddr) != expected) return false;
+-    store(mem_.base() + vaddr, value);
+-    return true;
++    if (!check_access(vaddr, 2, kPageRead | kPageWrite, true)) return false;
++    return host_cas<std::uint16_t>(mem_.base() + vaddr, value, expected);
+ }
+ 
+ bool GuestThread::MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) {
+-    if (!check_access(vaddr, 4, kPageRead | kPageWrite, true) || load<std::uint32_t>(mem_.base() + vaddr) != expected) return false;
+-    store(mem_.base() + vaddr, value);
+-    return true;
++    if (!check_access(vaddr, 4, kPageRead | kPageWrite, true)) return false;
++    return host_cas<std::uint32_t>(mem_.base() + vaddr, value, expected);
+ }
+ 
+ bool GuestThread::MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) {
+-    if (!check_access(vaddr, 8, kPageRead | kPageWrite, true) || load<std::uint64_t>(mem_.base() + vaddr) != expected) return false;
+-    store(mem_.base() + vaddr, value);
+-    return true;
++    if (!check_access(vaddr, 8, kPageRead | kPageWrite, true)) return false;
++    return host_cas<std::uint64_t>(mem_.base() + vaddr, value, expected);
++}
++
++// zb-opt-r2: Dynarmic folds loads from such pages into constants. Only pages that are
++// executable and not writable qualify: translated code there is invalidated whenever the
++// range is unmapped or reprotected, and JIT output (Mono) is writable, so it never qualifies.
++bool GuestThread::IsReadOnlyMemory(std::uint32_t vaddr) {
++    const std::uint8_t flags = mem_.page_flags(vaddr);
++    return (flags & (kPageMapped | kPageExec | kPageWrite)) == (kPageMapped | kPageExec);
+ }
+ 
+ std::optional<std::uint32_t> GuestThread::MemoryReadCode(std::uint32_t vaddr) {
+diff --git a/core/src/hang_watchdog.cpp b/core/src/hang_watchdog.cpp
+index 34e34e3..959882e 100644
+--- a/core/src/hang_watchdog.cpp
++++ b/core/src/hang_watchdog.cpp
+@@ -12,6 +12,8 @@
+ #include <thread>
+ 
+ #include "zb/host_jni.h"
++#include "zb/log.h"
++#include "zb/process.h"
+ #include "zb/runtime_report.h"
+ #include "zb/syscalls.h"
+ 
+@@ -223,6 +225,28 @@ HangWatchdog::HangWatchdog(SnapshotFn snapshot) : snapshot_(std::move(snapshot))
+ bool HangWatchdog::sample(Clock::time_point now) {
+     const std::vector<ThreadActivitySample> current = snapshot_();
+ 
++    // Guest-thread census, refreshed every sample so the report taken during a hang shows the hang.
++    {
++        static int stuck_samples = 0;
++        bool stuck_signal = false;
++        const std::vector<std::string> census = Process::describe_all_guest_threads(stuck_signal);
++        std::string chunk;
++        unsigned chunk_index = 0;
++        for (const std::string& line : census) {
++            if (!chunk.empty() && chunk.size() + line.size() > 560) {
++                if (chunk_index < 12) runtime_report().note_watch_detail("guests-" + std::to_string(++chunk_index), chunk);
++                chunk.clear();
++            }
++            chunk += (chunk.empty() ? "" : " | ") + line;
++        }
++        if (!chunk.empty() && chunk_index < 12) runtime_report().note_watch_detail("guests-" + std::to_string(++chunk_index), chunk);
++        stuck_samples = stuck_signal ? stuck_samples + 1 : 0;
++        if (stuck_samples >= 2) {
++            log("guest-census: undelivered guest signal for %d samples", stuck_samples);
++            for (const std::string& line : census) log("guest-census %s", line.c_str());
++        }
++    }
++
+     std::vector<State> next;
+     next.reserve(current.size());
+     for (const ThreadActivitySample& sample : current) {
+diff --git a/core/src/jni/proxy_runtime.cpp b/core/src/jni/proxy_runtime.cpp
+index dc65b36..41ebfd4 100644
+--- a/core/src/jni/proxy_runtime.cpp
++++ b/core/src/jni/proxy_runtime.cpp
+@@ -136,7 +136,10 @@ LibraryRuntimeOptions guest_runtime_options(const GuestRuntimeLayout& layout, co
+     options.sysroot = layout.sysroot;
+     options.target_sdk = target_sdk;
+     options.preload = "libzbjni.so";
+-    options.guest_environment = {"LD_LIBRARY_PATH=" + layout.guest_lib_dir + ":" + plugin_root + "/lib"};
++    options.guest_environment = {"LD_LIBRARY_PATH=" + layout.guest_lib_dir + ":" + plugin_root + "/lib",
++                                 // zb-opt-r2: Boehm GC (Unity Mono) starts with a 96 MiB heap and
++                                 // grows it more eagerly, so it collects less often.
++                                 "GC_INITIAL_HEAP_SIZE=100663296", "GC_FREE_SPACE_DIVISOR=2"};
+     return options;
+ }
+ 
+@@ -179,6 +182,15 @@ bool ProxyRuntime::activate_plugin(JniBackend::Env env, const std::string& plugi
+         GuestRuntimeLayout layout;
+         if (!resolve_guest_runtime_layout(parent_of(plugins), layout, error)) return false;
+         options = guest_runtime_options(layout, root, target_sdk);
++        // Unity 4.0 uses an absolute path for the Android NDK library.
++        engine_.add_path_alias("/system/lib/libandroid.so",
++                               layout.guest_lib_dir + "/libandroid.so");
++        // zb-fix-egl-path: Unity 4 also dlopens /system/lib/libEGL.so by absolute path (its
++        // timer, on every call until it succeeds); the GLES libraries for the same reason.
++        for (const char* gl_library : {"libEGL.so", "libGLESv2.so", "libGLESv1_CM.so"}) {
++            engine_.add_path_alias(std::string("/system/lib/") + gl_library,
++                                   layout.guest_lib_dir + "/" + gl_library);
++        }
+     }
+     std::string bind_error;
+     if (!engine_.bind_class_loader(env, class_loader, bind_error)) {
+@@ -193,6 +205,35 @@ bool ProxyRuntime::activate_plugin(JniBackend::Env env, const std::string& plugi
+         // opens something beside "its own" library finds the real thing (IL2CPP does exactly
+         // this and otherwise reports that it cannot load).
+         engine_.add_path_alias(root + "/proxy/", root + "/lib/");
++        // Stage 30: Unity 4's Mono looks for ordinary files at
++        // <copied APK>/assets/bin/Data/Managed/...; the APK is a ZIP file.
++        // Java mirrors the ten managed DLLs before activate_plugin() runs.
++        // Both Android aliases are necessary: libc and Java use different paths.
++        const std::string apk_managed_suffix = "/base.apk/assets/bin/Data/Managed";
++        const std::string mirrored_managed = root + "/zb-asset-files/assets/bin/Data/Managed";
++        engine_.add_path_alias(root + apk_managed_suffix, mirrored_managed);
++        const std::string data_data = "/data/data/";
++        const std::string data_user = "/data/user/0/";
++        if (root.compare(0, data_data.size(), data_data) == 0) {
++            engine_.add_path_alias(data_user + root.substr(data_data.size()) + apk_managed_suffix,
++                                   mirrored_managed);
++        } else if (root.compare(0, data_user.size(), data_user) == 0) {
++            engine_.add_path_alias(data_data + root.substr(data_user.size()) + apk_managed_suffix,
++                                   mirrored_managed);
++        }
++        // Stage 31: directory-level aliases, needed for Mono's parent stat/access
++        // probes before it ever attempts to open mscorlib.dll.
++        // Leave base.apk itself as a real ZIP for Unity AssetManager.
++        const std::string apk_assets_suffix = "/base.apk/assets";
++        const std::string mirrored_assets = root + "/zb-asset-files/assets";
++        engine_.add_path_alias(root + apk_assets_suffix, mirrored_assets);
++        if (root.compare(0, data_data.size(), data_data) == 0) {
++            engine_.add_path_alias(data_user + root.substr(data_data.size()) + apk_assets_suffix,
++                                   mirrored_assets);
++        } else if (root.compare(0, data_user.size(), data_user) == 0) {
++            engine_.add_path_alias(data_data + root.substr(data_user.size()) + apk_assets_suffix,
++                                   mirrored_assets);
++        }
+         target_sdk_ = target_sdk;
+         options_ = std::move(options);
+         log("guest JNI runtime: plugin %s activated (targetSdk %u)", root.c_str(), target_sdk);
+@@ -403,11 +444,10 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
+             });
+     }
+     if (configuration_backend != nullptr) {
+-        HostAssets* assets = host_assets_;
+         host_configuration_ = new HostConfiguration(*runtime_, *configuration_backend,
+-                                                    [assets](std::uint32_t handle) -> void* {
+-                                                        if (assets == nullptr) return nullptr;
+-                                                        const std::uint64_t manager = assets->manager_for(handle);
++                                                    [this](std::uint32_t handle) -> void* {
++                                                        if (host_assets_ == nullptr) return nullptr;
++                                                        const std::uint64_t manager = host_assets_->manager_for(handle);
+                                                         return reinterpret_cast<void*>(static_cast<std::uintptr_t>(manager));
+                                                     });
+     }
+diff --git a/core/src/library_runtime.cpp b/core/src/library_runtime.cpp
+index 699f0fa..40b10f4 100644
+--- a/core/src/library_runtime.cpp
++++ b/core/src/library_runtime.cpp
+@@ -1,5 +1,7 @@
+ #include "zb/library_runtime.h"
+ 
++#include <sys/mman.h>
++
+ #include <condition_variable>
+ #include <cstdlib>
+ #include <cstring>
+@@ -488,6 +490,23 @@ GuestMemory& LibraryRuntime::memory() {
+     return impl_->process.memory();
+ }
+ 
++std::uint32_t LibraryRuntime::map_guest_code(const std::uint32_t* words, std::size_t count) {
++    // zb-opt-r2
++    Process& process = impl_->process;
++    GuestMemory& memory = process.memory();
++    std::lock_guard<std::mutex> lock(process.mm_mutex());
++    const std::uint64_t size = page_round_up(count * sizeof(std::uint32_t));
++    const std::uint32_t at = memory.find_free(size, process.mmap_limit);
++    if (at == 0 || !memory.map_anon(at, size, PROT_READ | PROT_WRITE)) return 0;
++    std::memcpy(memory.base() + at, words, count * sizeof(std::uint32_t));
++    if (!memory.protect(at, size, PROT_READ | PROT_EXEC)) {
++        memory.unmap(at, size);
++        return 0;
++    }
++    process.forget_mappings(at, size);
++    return at;
++}
++
+ std::vector<std::string> LibraryRuntime::mapped_file_paths() const {
+     return impl_->process.mapped_file_paths();
+ }
+diff --git a/core/src/process.cpp b/core/src/process.cpp
+index 1ee6046..01f9205 100644
+--- a/core/src/process.cpp
++++ b/core/src/process.cpp
+@@ -359,6 +359,9 @@ std::unique_ptr<GuestThread> Process::create_borrower(GuestThread& carrier) {
+     borrower->set_fpscr(carrier.fpscr());
+     borrower->set_tls(carrier.tls());
+     borrower->tid = carrier.tid;
++    // create_borrower runs on the borrowing host thread (LibraryRuntime::borrow), which is the
++    // only thread that ever runs this borrower; interrupt() must reach it, not the carrier.
++    borrower->interrupt_tid = static_cast<std::int32_t>(::syscall(SYS_gettid));
+     borrower->sigmask = carrier.sigmask;
+     borrower->altstack = carrier.altstack;
+     std::lock_guard<std::mutex> lock(threads_mutex_);
+@@ -593,6 +596,39 @@ bool Process::after_stop(GuestThread& thread) {
+ 
+ Process* Process::reporter_process = nullptr;
+ 
++std::vector<std::string> Process::describe_guest_threads(bool& stuck_signal) {
++    // try_lock: a hung guest may hold mm_mutex_; then addresses stay unnamed instead of the
++    // watchdog hanging too.
++    std::unique_lock<std::mutex> mm(mm_mutex_, std::try_to_lock);
++    const auto name = [&](std::uint32_t addr) -> std::string {
++        if (!mm.owns_lock()) return "?";
++        std::string where = describe_address(addr);
++        const std::size_t slash = where.rfind('/');
++        return slash == std::string::npos ? where : where.substr(slash + 1);
++    };
++    std::vector<std::string> lines;
++    std::lock_guard<std::mutex> lock(threads_mutex_);
++    const auto one = [&](GuestThread* t, bool borrower) {
++        const auto& r = t->regs();
++        const std::uint64_t pending = t->pending_signals();
++        if ((pending & ~t->sigmask) != 0) stuck_signal = true;
++        char line[160];
++        std::snprintf(line, sizeof line, "%d%s%s pend=%llx mask=%llx d=%d pc=%08x lr=%08x sp=%08x",
++                      t->tid, borrower ? "B" : "", t->blocking() ? "*" : "",
++                      static_cast<unsigned long long>(pending), static_cast<unsigned long long>(t->sigmask),
++                      t->call_depth, r[15], r[14], r[13]);
++        lines.push_back(std::string(line) + " pc@" + name(r[15]) + " lr@" + name(r[14]));
++    };
++    for (GuestThread* t : borrowers_) one(t, true);
++    for (GuestThread* t : threads_) one(t, false);
++    return lines;
++}
++
++std::vector<std::string> Process::describe_all_guest_threads(bool& stuck_signal) {
++    if (reporter_process == nullptr) return {};
++    return reporter_process->describe_guest_threads(stuck_signal);
++}
++
+ // The translator does not always throw when it cannot go on: a failed check inside it calls
+ // std::terminate directly, and the process dies with the message "terminating" and a stripped
+ // backtrace. Nothing can catch that, but the guest program counter of the thread it happened on
+@@ -753,6 +789,77 @@ void Process::crash_report(const Stop& stop, GuestThread& thread) const {
+     runtime_report().note_crash_detail("recent-egl-calls", egl_recent_calls());
+     log("  pc in %s", describe_address(stop.pc).c_str());
+     log("  lr in %s", describe_address(r[14]).c_str());
++    // zb-wwz-diag11: code addresses on the guest stack.
++    for (std::uint32_t i = 0, shown = 0; i < 2048 && shown < 40; ++i) {
++        const std::uint32_t at = r[13] + i * 4;
++        if (!mem_.accessible(at, 4, kPageRead)) break;
++        std::uint32_t v;
++        std::memcpy(&v, mem_.host_ptr(at, 4, kPageRead), 4);
++        if (v < 0x1000) continue;
++        const std::string where = describe_address(v & ~1u);
++        if (where == "?" || where.find(".so") == std::string::npos) continue;
++        log("  stack sp+0x%03x %08x %s", i * 4, v, where.c_str());
++        ++shown;
++    }
++    // zb-wwz-diag12: class sizes as linked from the scripts.
++    {
++        auto word = [&](std::uint32_t addr) -> std::uint32_t {
++            if (!mem_.accessible(addr, 4, kPageRead)) return 0;
++            std::uint32_t w;
++            std::memcpy(&w, mem_.host_ptr(addr, 4, kPageRead), 4);
++            return w;
++        };
++        std::uint32_t base = 0;
++        for (std::uint32_t i = 0; i < 2048 && base == 0; ++i) {
++            const std::uint32_t v = word(r[13] + i * 4) & ~1u;
++            const std::string where = describe_address(v);
++            const std::size_t at = where.find("libUnrealEngine3.so offset 0x");
++            if (at != std::string::npos) base = v - static_cast<std::uint32_t>(std::stoul(where.substr(at + 29), nullptr, 16));
++        }
++        if (base != 0) {
++            const std::uint32_t list = word(base + 0x1812f60), count = word(base + 0x1812f64);
++            auto name_of = [&](std::uint32_t idx) -> std::string {
++                if (idx >= count) return "?";
++                const std::uint32_t e = word(list + idx * 4);
++                if (e == 0) return "?";
++                const bool wide = (word(e) & 1) != 0;
++                std::string t;
++                for (std::uint32_t k = 0; k < 96; ++k) {
++                    std::uint32_t ch = wide ? word(e + 8 + k * 4) : (word(e + 8 + (k & ~3u)) >> ((k & 3) * 8)) & 0xff;
++                    if (ch == 0) break;
++                    t.push_back(static_cast<char>(ch < 0x80 ? ch : '?'));
++                }
++                return t;
++            };
++            const std::uint32_t engine = word(base + 0x18697a4);
++            const std::uint32_t class_class = word(word(engine + 0x34) + 0x34);
++            const std::uint32_t objs = word(base + 0x18534a0), nobj = word(base + 0x18534a4);
++            std::uint32_t object_cls = 0, actor_cls = 0, engine_cls = 0;
++            for (std::uint32_t i = 0; i < nobj && i < 2000000; ++i) {
++                const std::uint32_t o = word(objs + i * 4);
++                if (o == 0 || word(o + 0x34) != class_class) continue;
++                const std::string n = name_of(word(o + 44));
++                if (n == "Object") object_cls = o;
++                else if (n == "Actor") actor_cls = o;
++                else if (n == "Engine") engine_cls = o;
++            }
++            int size_off = -1;
++            for (int off = 0x40; off < 0x100 && object_cls && actor_cls && engine_cls; off += 4) {
++                if (word(object_cls + off) == 64 && word(actor_cls + off) == 456 && word(engine_cls + off) == 1608) {
++                    size_off = off;
++                    break;
++                }
++            }
++            log("wwz-cls: base 0x%08x classclass 0x%08x size offset %d", base, class_class, size_off);
++            for (std::uint32_t i = 0; size_off >= 0 && i < nobj && i < 2000000; ++i) {
++                const std::uint32_t o = word(objs + i * 4);
++                if (o == 0 || word(o + 0x34) != class_class) continue;
++                const std::uint32_t flags_hi = word(o + 0xc);
++                if ((flags_hi & 0x04000000u) == 0) continue;  // RF_Native
++                log("wwz-cls: %s %u %08x", name_of(word(o + 44)).c_str(), word(o + static_cast<std::uint32_t>(size_off)), flags_hi);
++            }
++        }
++    }
+ 
+     // Bounded, allocation-light crash detail for RuntimeReport: this must never crash inside
+     // the crash path, since it runs while the process is already dying.
+diff --git a/core/src/runtime_report.cpp b/core/src/runtime_report.cpp
+index 81ba276..1d00ea5 100644
+--- a/core/src/runtime_report.cpp
++++ b/core/src/runtime_report.cpp
+@@ -233,6 +233,12 @@ void RuntimeReport::note_signal_restart(std::uint32_t nr, const char* name,
+ }
+ 
+ void RuntimeReport::note_gl_call(const char* function, std::uint64_t host_tid) {
++    // zb-opt-r2: the hot path. This ran on every GL call of the render thread.
++    if (gl_calls_seen_.load(std::memory_order_relaxed)) {
++        gl_calls_extra_.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    gl_calls_seen_.store(true, std::memory_order_relaxed);
+     bool structural = false;
+     std::shared_ptr<Observer> observer;
+     {
+@@ -482,7 +488,7 @@ std::string RuntimeReport::first_unimplemented_host_call() const {
+ 
+ std::uint64_t RuntimeReport::gl_calls() const {
+     std::lock_guard<std::mutex> lock(mutex_);
+-    return gl_call_total_;
++    return gl_call_total_ + gl_calls_extra_.load(std::memory_order_relaxed);
+ }
+ 
+ std::string RuntimeReport::text() const {
+@@ -592,7 +598,7 @@ std::string RuntimeReport::text() const {
+         }
+     }
+ 
+-    append_count(out, "gl-calls", gl_call_total_);
++    append_count(out, "gl-calls", gl_call_total_ + gl_calls_extra_.load(std::memory_order_relaxed));
+     out += "gl-first-call: ";
+     if (gl_call_total_ == 0) {
+         out += "(none)";
+@@ -671,6 +677,8 @@ void RuntimeReport::clear() {
+     opened_paths_.clear();
+     failed_opens_.clear();
+     gl_call_total_ = 0;
++    gl_calls_extra_.store(0, std::memory_order_relaxed);
++    gl_calls_seen_.store(false, std::memory_order_relaxed);
+     gl_first_call_function_.clear();
+     gl_first_call_tid_ = 0;
+     gl_egl_context_known_ = false;
+diff --git a/core/src/syscalls.cpp b/core/src/syscalls.cpp
+index b638903..4252ccb 100644
+--- a/core/src/syscalls.cpp
++++ b/core/src/syscalls.cpp
+@@ -26,6 +26,10 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cctype>
++#include <atomic>
++#include <array>
+ #include <cerrno>
+ #include <climits>
+ #include <csignal>
+@@ -36,6 +40,8 @@
+ #include <mutex>
+ #include <string>
+ #include <string_view>
++#include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ #include "gen/syscall_nrs_arm.h"
+@@ -80,6 +86,68 @@ struct Ctx {
+     bool no_result = false;
+ };
+ 
++// Stage 28: actual syscall sequence of the host OS thread that ultimately exits.
++// Unlike a blind stack scan, these are observed guest SVC instructions.
++struct Ktb28Syscall {
++    std::uint32_t number, pc, lr, a0, a1;
++};
++struct Ktb28SyscallRing {
++    std::array<Ktb28Syscall, 32> events{};
++    unsigned next = 0;
++    unsigned count = 0;
++};
++thread_local Ktb28SyscallRing ktb28_syscall_ring;
++
++// Stage 29: errors from ALL guest threads, not just the thread that exits.
++struct Ktb29Failure {
++    std::uint64_t seq;
++    std::uint32_t nr, pc, lr, a0, a1, a2;
++    std::int32_t result, tid;
++};
++static std::mutex ktb29_mutex;
++static std::array<Ktb29Failure, 64> ktb29_failures{};
++static std::uint64_t ktb29_failure_count = 0;
++static std::uint64_t ktb29_enosys_count = 0;
++static std::uint64_t ktb29_enomem_count = 0;
++static std::string ktb29_stderr;
++
++void ktb29_record_failure(std::uint32_t nr, const std::array<std::uint32_t, 6>& a,
++                          GuestThread& thread, std::int32_t result) {
++    if (result >= 0) return;
++    if (result == -ENOENT || result == -EAGAIN || result == -EINTR || result == -ETIMEDOUT) return;
++    // Preserve only errors relevant to unsupported/incorrect ABI or memory management.
++    if (result != -ENOSYS && result != -ENOMEM && result != -EINVAL &&
++        result != -EFAULT && result != -EACCES && result != -EPERM &&
++        result != -EBADF && result != -EOPNOTSUPP) return;
++    std::lock_guard<std::mutex> lock(ktb29_mutex);
++    ++ktb29_failure_count;
++    if (result == -ENOSYS) ++ktb29_enosys_count;
++    if (result == -ENOMEM) ++ktb29_enomem_count;
++    const std::uint64_t index = (ktb29_failure_count - 1) % ktb29_failures.size();
++    ktb29_failures[static_cast<std::size_t>(index)] =
++        {ktb29_failure_count, nr, thread.regs()[15], thread.regs()[14],
++         a[0], a[1], a[2], result,
++         static_cast<std::int32_t>(::syscall(SYS_gettid))};
++}
++
++void ktb29_record_guest_output(Ctx& c) {
++    if (c.a[0] != 1u && c.a[0] != 2u) return;
++    const std::size_t len = std::min<std::size_t>(c.a[2], 256);
++    if (!len) return;
++    const std::uint8_t* bytes = c.mem.host_ptr(c.a[1], len, kPageRead);
++    if (!bytes) return;
++    std::string msg;
++    msg.reserve(len);
++    for (std::size_t i = 0; i < len; ++i) {
++        const std::uint8_t ch = bytes[i];
++        msg += (ch >= 32 && ch <= 126) ? static_cast<char>(ch) : ' ';
++    }
++    std::lock_guard<std::mutex> lock(ktb29_mutex);
++    ktb29_stderr += msg;
++    if (ktb29_stderr.size() > 2000)
++        ktb29_stderr.erase(0, ktb29_stderr.size() - 2000);
++}
++
+ // Marks the thread as asleep in a host syscall for as long as it lives, so a guest signal posted
+ // to this thread breaks that syscall instead of waiting for it to end on its own.
+ class BlockingSection {
+@@ -171,6 +239,23 @@ void note_watched_open(const char* path, std::int32_t result) {
+     }
+ }
+ 
++// Stage 31: report the first path probes for Mono's virtual APK directories.
++// Structural entries are persisted before exit_group terminates the host process.
++// Stage 32: expose the non-existent APK/assets path as a virtual symlink,
++// so old Mono/Unity can canonicalize it into the mirrored on-disk assets.
++// The real base.apk remains a ZIP file for Android's AssetManager.
++bool ktb32_virtual_assets_link(const char* guest, const std::string& mapped) {
++    if (guest == nullptr) return false;
++    const std::string_view g(guest);
++    const std::string_view h(mapped);
++    constexpr std::string_view guest_end = "/base.apk/assets";
++    constexpr std::string_view mapped_end = "/zb-asset-files/assets";
++    return g.size() >= guest_end.size() &&
++           g.substr(g.size() - guest_end.size()) == guest_end &&
++           h.size() >= mapped_end.size() &&
++           h.substr(h.size() - mapped_end.size()) == mapped_end;
++}
++
+ void fill_stat64(g::stat64& out, const struct stat& st) {
+     std::memset(&out, 0, sizeof out);
+     out.st_dev = st.st_dev;
+@@ -257,8 +342,9 @@ std::int32_t sys_brk(Ctx& c) {
+             return static_cast<std::int32_t>(p.brk_current);
+         }
+     } else if (new_top < old_top) {
++        const bool had_code = c.mem.any_exec(static_cast<std::uint32_t>(new_top), old_top - new_top);  // zb-opt-mm
+         c.mem.unmap(static_cast<std::uint32_t>(new_top), old_top - new_top);
+-        p.invalidate(static_cast<std::uint32_t>(new_top), static_cast<std::uint32_t>(old_top - new_top));
++        if (had_code) p.invalidate(static_cast<std::uint32_t>(new_top), static_cast<std::uint32_t>(old_top - new_top));
+     }
+     p.brk_current = want;
+     return static_cast<std::int32_t>(want);
+@@ -295,6 +381,7 @@ std::int32_t sys_mmap2(Ctx& c) {
+     const bool textrel = !(flags & MAP_ANONYMOUS) && (prot & PROT_EXEC) && elf_has_textrel_marker(fd);
+     const int effective_prot = textrel ? (prot | PROT_WRITE) : prot;
+ 
++    const bool had_code = c.mem.any_exec(at, size);  // zb-opt-mm: only a replaced code range needs it
+     errno = 0;
+     const bool ok = (flags & MAP_ANONYMOUS) ? c.mem.map_anon(at, size, effective_prot)
+                                             : c.mem.map_file(at, size, effective_prot, flags, fd, offset);
+@@ -310,7 +397,7 @@ std::int32_t sys_mmap2(Ctx& c) {
+                                    n > 0 ? std::string(target, static_cast<std::size_t>(n)) : std::string("fd"));
+         if (textrel) c.proc.add_textrel_range(at, static_cast<std::uint32_t>(size));
+     }
+-    c.proc.invalidate(at, static_cast<std::uint32_t>(size));
++    if (had_code) c.proc.invalidate(at, static_cast<std::uint32_t>(size));
+     return static_cast<std::int32_t>(at);
+ }
+ 
+@@ -348,9 +435,10 @@ std::int32_t sys_mremap(Ctx& c) {
+         if (new_size < old_size) {
+             const std::uint32_t tail = old_addr + static_cast<std::uint32_t>(new_size);
+             const std::uint64_t cut = old_size - new_size;
++            const bool had_code = c.mem.any_exec(tail, cut);  // zb-opt-mm
+             if (!c.mem.unmap(tail, cut)) return -EINVAL;
+             c.proc.forget_mappings(tail, cut);
+-            c.proc.invalidate(tail, static_cast<std::uint32_t>(cut));
++            if (had_code) c.proc.invalidate(tail, static_cast<std::uint32_t>(cut));
+         }
+         return static_cast<std::int32_t>(old_addr);
+     }
+@@ -387,10 +475,10 @@ std::int32_t sys_mremap(Ctx& c) {
+         c.mem.unmap(at, new_size);
+         return -EACCES;
+     }
++    const bool had_code = c.mem.any_exec(old_addr, old_size);  // zb-opt-mm; `at` was free
+     if (!c.mem.unmap(old_addr, old_size)) return -EINVAL;
+     c.proc.forget_mappings(old_addr, old_size);
+-    c.proc.invalidate(old_addr, static_cast<std::uint32_t>(old_size));
+-    c.proc.invalidate(at, static_cast<std::uint32_t>(new_size));
++    if (had_code) c.proc.invalidate(old_addr, static_cast<std::uint32_t>(old_size));
+     return static_cast<std::int32_t>(at);
+ }
+ 
+@@ -399,9 +487,10 @@ std::int32_t sys_munmap(Ctx& c) {
+     if ((addr & kPageMask) || c.a[1] == 0) return -EINVAL;
+     const std::uint64_t size = page_round_up(c.a[1]);
+     if (static_cast<std::uint64_t>(addr) + size > kGuestSpaceSize) return -EINVAL;
++    const bool had_code = c.mem.any_exec(addr, size);  // zb-opt-mm
+     if (!c.mem.unmap(addr, size)) return -EINVAL;
+     c.proc.forget_mappings(addr, size);
+-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
++    if (had_code) c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+     return 0;
+ }
+ 
+@@ -413,8 +502,9 @@ std::int32_t sys_mprotect(Ctx& c) {
+     if (!c.mem.accessible(addr, size, 0)) return -ENOMEM;
+     int prot = static_cast<int>(c.a[2]);
+     if ((prot & PROT_EXEC) && c.proc.overlaps_textrel_range(addr, size)) prot |= PROT_WRITE;
++    const bool had_code = c.mem.any_exec(addr, size);  // zb-opt-mm: no blocks exist for non-exec pages
+     if (!c.mem.protect(addr, size, prot)) return -EACCES;
+-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
++    if (had_code) c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+     return 0;
+ }
+ 
+@@ -604,9 +694,17 @@ std::int32_t sys_statfs_common(Ctx& c, int rc, const struct statfs& st, std::uin
+ std::int32_t sys_fstatat64(Ctx& c) {
+     const char* path = guest_cstr(c.mem, c.a[1]);
+     if (!path) return -EFAULT;
++    const std::string host_path = c.proc.translate_path(path);
+     struct stat st;
+-    const int rc = ::fstatat(static_cast<int>(c.a[0]), c.proc.translate_path(path).c_str(), &st, static_cast<int>(c.a[3]));
+-    return sys_stat_common(c, rc, st, c.a[2]);
++    const int rc = ::fstatat(static_cast<int>(c.a[0]), host_path.c_str(), &st, static_cast<int>(c.a[3]));
++    if (rc == 0 && (c.a[3] & AT_SYMLINK_NOFOLLOW) != 0 &&
++        ktb32_virtual_assets_link(path, host_path) && S_ISDIR(st.st_mode)) {
++        st.st_mode = (st.st_mode & ~S_IFMT) | S_IFLNK;
++        st.st_size = static_cast<decltype(st.st_size)>(host_path.size());
++        runtime_report().note_gl_detail("ktb32-asset-lstat", "virtual symlink detected", true);
++    }
++    const std::int32_t result = sys_stat_common(c, rc, st, c.a[2]);
++    return result;
+ }
+ 
+ std::int32_t sys_statx(Ctx& c) {
+@@ -710,6 +808,15 @@ std::int32_t sys_futex(Ctx& c, bool time64) {
+     case FUTEX_WAKE:
+     case FUTEX_WAKE_BITSET:
+         return result_of(::syscall(SYS_futex, uaddr, op, c.a[2], nullptr, nullptr, c.a[5]));
++    case FUTEX_REQUEUE:
++    case FUTEX_CMP_REQUEUE:
++    case FUTEX_WAKE_OP: {
++        // The ARM guest's uaddr2 is NOT a host pointer; translate it.
++        std::uint8_t* uaddr2 = c.mem.host_ptr(c.a[4], 4, kPageRead);
++        if (!uaddr2) return -EFAULT;
++        return result_of(::syscall(SYS_futex, uaddr, op, c.a[2],
++                                   static_cast<unsigned long>(c.a[3]), uaddr2, c.a[5]));
++    }
+     default:
+         if (c.proc.first_time(kSeenFutex | static_cast<std::uint32_t>(cmd))) log("unsupported futex command %d", cmd);
+         return -ENOSYS;
+@@ -754,11 +861,343 @@ std::int32_t sys_pipe2(Ctx& c) {
+     return 0;
+ }
+ 
++// zb-wwz-diag: paths of the game data and what the guest got for them.
++std::atomic<int> wwz_obb_fds[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
++
++bool wwz_obb_fd(int fd) {
++    if (fd < 0) return false;
++    for (auto& f : wwz_obb_fds) if (f.load(std::memory_order_relaxed) == fd) return true;
++    return false;
++}
++
++void wwz_diag_fd(Ctx& c, std::uint32_t nr, std::int32_t res) {  // zb-wwz-diag3
++    int fd = -1;
++    switch (nr) {
++    case NR_read: case NR_readv: case NR_pread64: case NR_lseek: case NR__llseek:
++    case NR_fstat64: case NR_close: fd = static_cast<int>(c.a[0]); break;
++    case NR_mmap2: fd = static_cast<int>(c.a[4]); break;
++    default: return;
++    }
++    if (!wwz_obb_fd(fd)) return;
++    if (nr == NR_close && res == 0) {
++        for (auto& f : wwz_obb_fds) { int e = fd; f.compare_exchange_strong(e, -1); }
++    }
++    static std::atomic<unsigned> count{0};
++    if (count.fetch_add(1, std::memory_order_relaxed) >= 600) return;
++    log("wwz-fd: %s fd=%d a1=0x%x a2=0x%x a3=0x%x a4=0x%x a5=0x%x -> %d", syscall_name(nr), fd,
++        c.a[1], c.a[2], c.a[3], c.a[4], c.a[5], res);
++}
++
++thread_local int wwz_follow = 0;  // zb-wwz-diag4
++
++void wwz_diag_abort(Ctx& c, std::uint32_t nr) {  // zb-wwz-diag5
++    std::uint32_t sig = 0;
++    if (nr == NR_tgkill || nr == NR_rt_tgsigqueueinfo) sig = c.a[2];  // zb-wwz-diag6
++    else if (nr == NR_tkill || nr == NR_kill) sig = c.a[1];
++    else return;
++    if (sig != 6) return;
++    const auto& r = c.thread.regs();
++    log("wwz-abort: %s sig=%u pc=0x%08x lr=0x%08x sp=0x%08x", syscall_name(nr), sig, r[15], r[14], r[13]);
++    log("wwz-abort:   pc in %s", c.proc.describe_address(r[15]).c_str());
++    log("wwz-abort:   lr in %s", c.proc.describe_address(r[14]).c_str());
++    const std::uint32_t words = 1024;
++    const std::uint8_t* stack = c.mem.host_ptr(r[13], words * 4, kPageRead);
++    if (stack == nullptr) return;
++    // zb-wwz-diag7: wide-character text on the stack (the engine's error message).
++    {
++        std::uint32_t span = 0x10000;
++        const std::uint8_t* deep = nullptr;
++        while (span >= 0x1000 && (deep = c.mem.host_ptr(r[13], span, kPageRead)) == nullptr) span /= 2;
++        int lines = 0;
++        std::string run;
++        for (std::uint32_t off = 0; deep != nullptr && off + 4 <= span && lines < 60; off += 4) {
++            std::uint32_t ch;
++            std::memcpy(&ch, deep + off, 4);
++            if (ch >= 0x20 && ch < 0x7f) {
++                run.push_back(static_cast<char>(ch));
++                continue;
++            }
++            if (run.size() >= 8) {
++                log("wwz-text: sp+0x%05x %s", off - static_cast<std::uint32_t>(run.size()) * 4, run.substr(0, 300).c_str());
++                ++lines;
++            }
++            run.clear();
++        }
++    }
++    // zb-wwz-diag8: the engine's FName table.
++    for (std::uint32_t i = 0; i < words; ++i) {
++        std::uint32_t v;
++        std::memcpy(&v, stack + i * 4, 4);
++        const std::string where = c.proc.describe_address(v & ~1u);
++        const std::size_t at = where.find("libUnrealEngine3.so offset 0x");
++        if (at == std::string::npos) continue;
++        const std::uint32_t off = static_cast<std::uint32_t>(std::stoul(where.substr(at + 29), nullptr, 16));
++        const std::uint32_t base = (v & ~1u) - off;
++        std::uint32_t names[3] = {};
++        const std::uint8_t* arr = c.mem.host_ptr(base + 0x1812f60, 12, kPageRead);
++        if (arr == nullptr) { log("wwz-names: table unreadable (base 0x%08x)", base); break; }
++        std::memcpy(names, arr, 12);
++        const std::uint8_t* list = c.mem.host_ptr(names[0], names[1] * 4, kPageRead);
++        if (list == nullptr || names[1] > 2000000) { log("wwz-names: list unreadable %08x %u", names[0], names[1]); break; }
++        std::vector<std::string> all_names(names[1]);  // zb-wwz-diag9
++        std::unordered_map<std::string, std::uint32_t> seen;
++        unsigned dups = 0, shown_dups = 0;
++        for (std::uint32_t n = 0; n < names[1]; ++n) {
++            std::uint32_t entry;
++            std::memcpy(&entry, list + n * 4, 4);
++            if (entry == 0) continue;
++            const std::uint8_t* e = c.mem.host_ptr(entry, 8 + 64 * 4, kPageRead);
++            if (e == nullptr) e = c.mem.host_ptr(entry, 8 + 64, kPageRead);
++            if (e == nullptr) continue;
++            std::uint32_t index;
++            std::memcpy(&index, e, 4);
++            const bool wide = (index & 1) != 0;
++            std::string text;
++            for (int k = 0; k < 64; ++k) {
++                std::uint32_t ch = 0;
++                if (wide) std::memcpy(&ch, e + 8 + k * 4, 4); else ch = e[8 + k];
++                if (ch == 0) break;
++                text.push_back(static_cast<char>(ch < 0x80 ? std::tolower(static_cast<int>(ch)) : '?'));
++            }
++            if (text == "getmapnameforenum" || text == "scriptinit" || text == "wwzgameengine" || text == "startgame") {
++                log("wwz-name: #%u index=0x%x %s '%s'", n, index, wide ? "wide" : "ansi", text.c_str());
++            }
++            all_names[n] = text;
++            auto [it, fresh] = seen.emplace(text, n);
++            if (!fresh) {
++                ++dups;
++                if (shown_dups++ < 30) log("wwz-dup: '%s' #%u and #%u", text.c_str(), it->second, n);
++            }
++        }
++        log("wwz-names: %u names, %u duplicated (base 0x%08x)", names[1], dups, base);
++        auto word = [&](std::uint32_t addr) -> std::uint32_t {
++            const std::uint8_t* p = c.mem.host_ptr(addr, 4, kPageRead);
++            std::uint32_t w = 0;
++            if (p != nullptr) std::memcpy(&w, p, 4);
++            return w;
++        };
++        auto name_of = [&](std::uint32_t idx) -> std::string {
++            return idx < all_names.size() ? all_names[idx] : std::string("?");
++        };
++        const std::uint32_t engine = word(base + 0x18697a4);
++        std::uint32_t cls = engine != 0 ? word(engine + 0x34) : 0;
++        log("wwz-fmap: GEngine=0x%08x class=0x%08x", engine, cls);
++        // zb-wwz-diag10: objects by name.
++        {
++            int name_off = -1;
++            for (int o = 0x18; o < 0x60 && engine != 0; o += 4) {
++                const std::string n = name_of(word(engine + o));
++                if (n == "wwzgameengine") { name_off = o; break; }
++            }
++            log("wwz-objs: name offset %d, GEngine name number %u", name_off,
++                name_off >= 0 ? word(engine + name_off + 4) : 0u);
++            const std::uint32_t objs = word(base + 0x18534a0), count = word(base + 0x18534a4);
++            log("wwz-objs: %u objects at 0x%08x", count, objs);
++            unsigned listed = 0;
++            for (std::uint32_t i = 0; name_off >= 0 && i < count && i < 2000000 && listed < 40; ++i) {
++                const std::uint32_t obj = word(objs + i * 4);
++                if (obj == 0) continue;
++                const std::string n = name_of(word(obj + name_off));
++                if (n != "wwzgameengine" && n != "phosphormobileengine" && n != "wwzplayercontroller") continue;
++                const std::uint32_t ocls = word(obj + 0x34), outer = word(obj + name_off - 4);
++                log("wwz-objs: #%u 0x%08x '%s'_%u class=0x%08x('%s') outer=0x%08x('%s') funcs=%u flags=%08x%08x",
++                    i, obj, n.c_str(), word(obj + name_off + 4), ocls, name_of(word(ocls + name_off)).c_str(), outer,
++                    name_of(word(outer + name_off)).c_str(), word(obj + 0x84), word(obj + 0xc), word(obj + 0x8));
++                ++listed;
++            }
++        }
++        for (int level = 0; level < 6 && cls != 0; ++level) {
++            const std::uint32_t data = word(cls + 0x80), num = word(cls + 0x84), max = word(cls + 0x88);
++            const std::uint32_t hash_ptr = word(cls + 0xb4), hash_size = word(cls + 0xb8);
++            log("wwz-fmap: L%d cls=0x%08x elems=0x%08x num=%u max=%u hash=0x%08x size=%u inline=0x%08x",
++                level, cls, data, num, max, hash_ptr, hash_size, word(cls + 0xb0));
++            unsigned shown = 0;
++            for (std::uint32_t e = 0; e < num && e < 4096; ++e) {
++                const std::uint32_t at = data + e * 20;
++                const std::uint32_t key = word(at), number = word(at + 4), value = word(at + 8);
++                const std::string nm = name_of(key);
++                if (shown < 24 || nm == "getmapnameforenum" || nm == "scriptinit") {
++                    log("wwz-fmap:   [%u] key=%u/%u '%s' value=0x%08x next=%d bucket=%d", e, key, number, nm.c_str(),
++                        value, static_cast<int>(word(at + 12)), static_cast<int>(word(at + 16)));
++                    ++shown;
++                }
++            }
++            if (hash_size != 0 && hash_size < 65536) {
++                const std::uint32_t table = hash_ptr != 0 ? hash_ptr : cls + 0xb0;
++                const std::uint32_t bucket = 30556u & (hash_size - 1);
++                int id = static_cast<int>(word(table + bucket * 4));
++                std::string chain;
++                for (int k = 0; k < 64 && id != -1; ++k) {
++                    chain += std::to_string(id) + "(" + name_of(word(data + static_cast<std::uint32_t>(id) * 20)) + ") ";
++                    id = static_cast<int>(word(data + static_cast<std::uint32_t>(id) * 20 + 12));
++                }
++                log("wwz-fmap:   chain for key 30556 bucket %u: %s", bucket, chain.c_str());
++            }
++            cls = word(cls + 0x40);
++        }
++        break;
++    }
++    int shown = 0;
++    for (std::uint32_t i = 0; i < words && shown < 40; ++i) {
++        std::uint32_t v;
++        std::memcpy(&v, stack + i * 4, 4);
++        if (v < 0x1000) continue;
++        const std::string where = c.proc.describe_address(v & ~1u);
++        if (where == "?" || where.find(".so") == std::string::npos) continue;
++        log("wwz-abort:   sp+0x%03x %08x %s", i * 4, v, where.c_str());
++        ++shown;
++    }
++}
++
++std::atomic<long long> wwz_obb_time{0};  // zb-wwz-diag13
++std::atomic<bool> wwz_classes_done{false};
++
++void wwz_diag_classes(Ctx& c) {
++    const long long start = wwz_obb_time.load();
++    if (start == 0 || wwz_classes_done.load()) return;
++    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    if (now - start < 5000) return;  // zb-wwz-diag14
++    auto word = [&](std::uint32_t addr) -> std::uint32_t {
++        const std::uint8_t* p = c.mem.host_ptr(addr, 4, kPageRead);
++        std::uint32_t w = 0;
++        if (p != nullptr) std::memcpy(&w, p, 4);
++        return w;
++    };
++    const auto& r = c.thread.regs();
++    std::uint32_t base = 0;
++    for (std::uint32_t i = 0; i < 4096 && base == 0; ++i) {
++        const std::uint8_t* p = c.mem.host_ptr(r[13] + i * 4, 4, kPageRead);
++        if (p == nullptr) break;
++        std::uint32_t v;
++        std::memcpy(&v, p, 4);
++        if (v < 0x1000) continue;
++        const std::string where = c.proc.describe_address(v & ~1u);
++        const std::size_t at = where.find("libUnrealEngine3.so offset 0x");
++        if (at != std::string::npos) base = (v & ~1u) - static_cast<std::uint32_t>(std::stoul(where.substr(at + 29), nullptr, 16));
++    }
++    if (base == 0) return;  // not an engine thread: try on a later call
++    if (wwz_classes_done.exchange(true)) return;
++    const std::uint32_t list = word(base + 0x1812f60), count = word(base + 0x1812f64);
++    auto name_of = [&](std::uint32_t idx) -> std::string {
++        if (idx >= count) return "?";
++        const std::uint32_t e = word(list + idx * 4);
++        if (e == 0) return "?";
++        const std::uint8_t* p = c.mem.host_ptr(e, 8 + 96 * 4, kPageRead);
++        if (p == nullptr) p = c.mem.host_ptr(e, 8 + 96, kPageRead);
++        if (p == nullptr) return "?";
++        std::uint32_t index;
++        std::memcpy(&index, p, 4);
++        const bool wide = (index & 1) != 0;
++        std::string t;
++        for (int k = 0; k < 96; ++k) {
++            std::uint32_t ch = 0;
++            if (wide) std::memcpy(&ch, p + 8 + k * 4, 4); else ch = p[8 + k];
++            if (ch == 0) break;
++            t.push_back(static_cast<char>(ch < 0x80 ? ch : '?'));
++        }
++        return t;
++    };
++    const std::uint32_t engine = word(base + 0x18697a4);
++    const std::uint32_t class_class = word(word(engine + 0x34) + 0x34);
++    const std::uint32_t objs = word(base + 0x18534a0), nobj = word(base + 0x18534a4);
++    std::uint32_t object_cls = 0, actor_cls = 0, engine_cls = 0;
++    for (std::uint32_t i = 0; i < nobj && i < 2000000; ++i) {
++        const std::uint32_t o = word(objs + i * 4);
++        if (o == 0 || word(o + 0x34) != class_class) continue;
++        const std::string n = name_of(word(o + 44));
++        if (n == "Object") object_cls = o;
++        else if (n == "Actor") actor_cls = o;
++        else if (n == "Engine") engine_cls = o;
++    }
++    int size_off = 0x48;  // zb-wwz-diag15: UStruct::PropertiesSize
++    for (int off = 0x40; off < 0x40 && object_cls && actor_cls && engine_cls; off += 4) {
++        if (word(object_cls + off) == 64 && word(actor_cls + off) == 456 && word(engine_cls + off) == 1608) {
++            size_off = off;
++            break;
++        }
++    }
++    log("wwz-cls: base 0x%08x engine 0x%08x classclass 0x%08x objects %u object/actor/engine %08x %08x %08x size offset %d",
++        base, engine, class_class, nobj, object_cls, actor_cls, engine_cls, size_off);
++    if (size_off < 0) {
++        for (int off = 0x40; off < 0x100; off += 4) {
++            log("wwz-cls: +0x%02x object=%u actor=%u engine=%u", off, word(object_cls + off), word(actor_cls + off),
++                word(engine_cls + off));
++        }
++        return;
++    }
++    for (std::uint32_t i = 0; i < nobj && i < 2000000; ++i) {
++        const std::uint32_t o = word(objs + i * 4);
++        if (o == 0 || word(o + 0x34) != class_class) continue;
++        const std::uint32_t flags_hi = word(o + 0xc);
++        if ((flags_hi & 0x04000000u) == 0) continue;  // RF_Native
++        log("wwz-cls: %s %u %08x", name_of(word(o + 44)).c_str(), word(o + static_cast<std::uint32_t>(size_off)), flags_hi);
++    }
++    // zb-wwz-diag16: fields of the classes whose size differs from the code.
++    for (std::uint32_t i = 0; i < nobj && i < 2000000; ++i) {
++        const std::uint32_t o = word(objs + i * 4);
++        if (o == 0 || word(o + 0x34) != class_class) continue;
++        const std::string cn = name_of(word(o + 44));
++        if (cn != "PhosphorMobileMenuImage" && cn != "WWZHealthBar" && cn != "PhosphorMobileMenuObject") continue;
++        log("wwz-prop: class %s size %u super %s", cn.c_str(), word(o + 0x48), name_of(word(word(o + 0x40) + 44)).c_str());
++        std::uint32_t f = word(o + 0x44);
++        for (int k = 0; k < 200 && f != 0; ++k, f = word(f + 0x3c)) {
++            char words[200];
++            std::snprintf(words, sizeof words, "%x %x %x %x %x %x %x %x %x %x %x %x", word(f + 0x40), word(f + 0x44),
++                          word(f + 0x48), word(f + 0x4c), word(f + 0x50), word(f + 0x54), word(f + 0x58), word(f + 0x5c),
++                          word(f + 0x60), word(f + 0x64), word(f + 0x68), word(f + 0x6c));
++            log("wwz-prop: %s.%s %s | %s", cn.c_str(), name_of(word(f + 44)).c_str(),
++                name_of(word(word(f + 0x34) + 44)).c_str(), words);
++        }
++    }
++    log("wwz-cls: end");
++}
++
++void wwz_diag_path(Ctx& c, std::uint32_t nr, std::int32_t res) {
++    wwz_diag_classes(c);
++    if (nr == NR_openat && res >= 0 && wwz_obb_time.load() == 0) {
++        const char* q = guest_cstr(c.mem, c.a[1]);
++        if (q != nullptr && std::strstr(q, ".obb") != nullptr) {
++            wwz_obb_time.store(std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count());
++        }
++    }
++    wwz_diag_abort(c, nr);
++    if (wwz_follow > 0) {
++        --wwz_follow;
++        static std::atomic<unsigned> count{0};
++        if (count.fetch_add(1, std::memory_order_relaxed) < 400) {
++            log("wwz-sys: %s(%u) a0=0x%x a1=0x%x a2=0x%x a3=0x%x a4=0x%x a5=0x%x -> %d",
++                syscall_name(nr), nr, c.a[0], c.a[1], c.a[2], c.a[3], c.a[4], c.a[5], res);
++        }
++    }
++    if (nr == NR_openat && res >= 0) {
++        const char* q = guest_cstr(c.mem, c.a[1]);
++        if (q != nullptr && std::strstr(q, ".obb") != nullptr) wwz_follow = 40;
++    }
++    wwz_diag_fd(c, nr, res);
++    if (nr != NR_openat && nr != NR_faccessat && nr != NR_fstatat64) return;
++    const char* p = guest_cstr(c.mem, c.a[1]);
++    if (p == nullptr) return;
++    if (nr == NR_openat && res >= 0 && std::strstr(p, ".obb") != nullptr) {
++        for (auto& f : wwz_obb_fds) { int e = -1; if (f.compare_exchange_strong(e, res)) break; }
++    }
++    if (std::strstr(p, "WWZ") == nullptr && std::strstr(p, "obb") == nullptr &&
++        std::strstr(p, "UnrealEngine") == nullptr && std::strstr(p, "Cooked") == nullptr &&
++        std::strstr(p, "Coalesced") == nullptr) return;
++    static std::atomic<unsigned> count{0};
++    if (count.fetch_add(1, std::memory_order_relaxed) >= 400) return;
++    log("wwz-path: %s %s flags=0x%x -> %d host=%s",
++        nr == NR_openat ? "open" : nr == NR_faccessat ? "access" : "stat", p,
++        nr == NR_openat ? c.a[2] : 0u, res, c.proc.translate_path(p).c_str());
++}
++
+ std::int32_t sys_path_call(Ctx& c, std::uint32_t path_arg, long (*call)(Ctx&, const char*)) {
+     const char* path = guest_cstr(c.mem, c.a[path_arg]);
+     if (!path) return -EFAULT;
+     const std::string host_path = c.proc.translate_path(path);
+-    return result_of(call(c, host_path.c_str()));
++    const std::int32_t result = result_of(call(c, host_path.c_str()));
++    return result;
+ }
+ 
+ 
+@@ -1186,6 +1625,11 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+     auto& regs = thread.regs();
+     Ctx c{proc, thread, proc.memory(), {regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]}};
+     const std::uint32_t nr = regs[7];
++    auto& ktb28_slot = ktb28_syscall_ring.events[ktb28_syscall_ring.next];
++    ktb28_slot = {nr, regs[15], regs[14], regs[0], regs[1]};
++    ktb28_syscall_ring.next = (ktb28_syscall_ring.next + 1) % ktb28_syscall_ring.events.size();
++    if (ktb28_syscall_ring.count < ktb28_syscall_ring.events.size())
++        ++ktb28_syscall_ring.count;
+     std::int32_t res = -ENOSYS;
+     const auto guest_tid = [&] {
+         return thread.tid != 0 ? thread.tid : static_cast<std::int32_t>(::syscall(SYS_gettid));
+@@ -1204,11 +1648,236 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+         if (trace_enabled()) log("exit(%d)", static_cast<int>(c.a[0]));
+         thread.exit_status = static_cast<int>(c.a[0] & 0xff);
+         return false;
+-    case NR_exit_group:
+-        if (trace_enabled()) log("exit_group(%d)", static_cast<int>(c.a[0]));
+-        if (proc.thread_count() > 1) std::_Exit(static_cast<int>(c.a[0] & 0xff));
+-        proc.request_exit(static_cast<int>(c.a[0] & 0xff));
++    case NR_exit_group: {
++        const int status = static_cast<int>(c.a[0] & 0xff);
++        const std::size_t threads = proc.thread_count();
++        const std::uint32_t pc = regs[15];
++        const std::uint32_t lr = regs[14] & ~1u;
++        const std::string pc_where = proc.describe_address(pc & ~1u);
++        const std::string lr_where = proc.describe_address(lr);
++        char detail[512];
++        std::snprintf(detail, sizeof(detail),
++                      "status=%d tid=%d threads=%zu pc=0x%08x %s lr=0x%08x %s sp=0x%08x",
++                      status, guest_tid(), threads, pc, pc_where.c_str(),
++                      lr, lr_where.c_str(), regs[13]);
++        log("guest exit_group: %s", detail);
++        runtime_report().note_jni_detail("guest-exit-group", detail, true);
++
++        // Stage 27: inspect the guest ARM32 stack before exit_group.
++        {
++            char snapshot[320];
++            std::snprintf(
++                snapshot, sizeof(snapshot),
++                "r4=%08x r5=%08x r6=%08x r7=%08x "
++                "r8=%08x r9=%08x r10=%08x r11=%08x "
++                "r12=%08x sp=%08x lr=%08x pc=%08x depth=%d",
++                regs[4], regs[5], regs[6], regs[7],
++                regs[8], regs[9], regs[10], regs[11],
++                regs[12], regs[13], regs[14], regs[15],
++                thread.call_depth);
++
++            runtime_report().note_jni_detail(
++                "guest-exit-registers", snapshot, true);
++
++            std::string game_frames;
++            std::string system_frames;
++            unsigned game_count = 0;
++            unsigned system_count = 0;
++
++            for (std::uint64_t offset = 0; offset < 16384; offset += 4) {
++                const std::uint64_t address =
++                    static_cast<std::uint64_t>(regs[13]) + offset;
++
++                if (address > 0xfffffffbULL)
++                    break;
++
++                const std::uint8_t* src = c.mem.host_ptr(
++                    static_cast<std::uint32_t>(address),
++                    4, kPageRead);
++
++                if (src == nullptr)
++                    break;
++
++                std::uint32_t candidate = 0;
++                std::memcpy(&candidate, src, sizeof(candidate));
++
++                if (candidate < 0x10000)
++                    continue;
++
++                std::string where =
++                    proc.describe_address(candidate & ~1u);
++
++                const bool game =
++                    where.find("libunity.so") != std::string::npos ||
++                    where.find("libmono.so") != std::string::npos;
++
++                const bool system =
++                    where.find("/lib/libc.so") != std::string::npos ||
++                    where.find("/lib/libdl.so") != std::string::npos ||
++                    where.find("/lib/libstdc++.so") != std::string::npos;
++
++                if (!game && !system)
++                    continue;
++
++                const std::size_t slash = where.find_last_of('/');
++                if (slash != std::string::npos)
++                    where.erase(0, slash + 1);
++
++                char position[48];
++                std::snprintf(position, sizeof(position),
++                              "sp+%04llx=%08x ",
++                              static_cast<unsigned long long>(offset),
++                              candidate);
++
++                const std::string item =
++                    std::string(position) + where + "; ";
++
++                std::string& output =
++                    game ? game_frames : system_frames;
++                unsigned& count =
++                    game ? game_count : system_count;
++
++                if (count < 12 && output.size() + item.size() < 530) {
++                    output += item;
++                    ++count;
++                }
++            }
++
++            runtime_report().note_jni_detail(
++                "guest-exit-game-stack",
++                game_frames.empty() ? "none" : game_frames, true);
++
++            runtime_report().note_jni_detail(
++                "guest-exit-system-stack",
++                system_frames.empty() ? "none" : system_frames, true);
++        }
++        // Stage 28: preserve the last 24 real syscalls on this OS thread, including
++        // their guest PC, LR and arguments. A code address in the guest libc is not
++        // assumed to identify the original caller.
++        {
++            const auto& ring = ktb28_syscall_ring;
++            const unsigned keep = ring.count < 24u ? ring.count : 24u;
++            const unsigned first =
++                (ring.next + static_cast<unsigned>(ring.events.size()) - keep) %
++                static_cast<unsigned>(ring.events.size());
++            for (unsigned group = 0; group < 3 && group * 8 < keep; ++group) {
++                std::string history;
++                for (unsigned j = 0; j < 8 && group * 8 + j < keep; ++j) {
++                    const unsigned slot = (first + group * 8 + j) % ring.events.size();
++                    const Ktb28Syscall& e = ring.events[slot];
++                    char detail_event[104];
++                    std::snprintf(detail_event, sizeof detail_event,
++                                  "%s(%u) pc=%08x lr=%08x a0=%08x; ",
++                                  syscall_name(e.number), e.number, e.pc, e.lr, e.a0);
++                    if (history.size() + std::strlen(detail_event) > 550) break;
++                    history += detail_event;
++                }
++                runtime_report().note_jni_detail(
++                    "guest-exit-syscalls-" + std::to_string(group + 1), history, true);
++            }
++        }
++
++        // Stage 27 found addresses in .rel.dyn/.dynstr, not in Mono code.
++        // Keep ONLY guest-mapped executable candidates this time. They are still
++        // candidates, not validated return addresses.
++        {
++            std::string unity_code, mono_code, other_code;
++            unsigned nu = 0, nm = 0, no = 0;
++            for (std::uint64_t off = 0; off < 16384; off += 4) {
++                const std::uint64_t addr = static_cast<std::uint64_t>(regs[13]) + off;
++                if (addr > 0xfffffffbULL) break;
++                const auto* src = c.mem.host_ptr(static_cast<std::uint32_t>(addr), 4, kPageRead);
++                if (!src) break;
++                std::uint32_t word = 0;
++                std::memcpy(&word, src, 4);
++                const std::uint32_t code = word & ~1u;
++                if (code < 65536 || !c.mem.accessible(code, 2, kPageExec)) continue;
++                std::string symbol = proc.describe_address(code);
++                const bool unity = symbol.find("libunity.so") != std::string::npos;
++                const bool mono = symbol.find("libmono.so") != std::string::npos;
++                std::string& dest = unity ? unity_code : mono ? mono_code : other_code;
++                unsigned& counter = unity ? nu : mono ? nm : no;
++                if (counter >= (unity || mono ? 6u : 3u)) continue;
++                const std::size_t slash = symbol.rfind('/');
++                if (slash != std::string::npos) symbol.erase(0, slash + 1);
++                char prefix[56];
++                std::snprintf(prefix, sizeof prefix, "+%04llx=%08x ",
++                              static_cast<unsigned long long>(off), word);
++                if (dest.size() + std::strlen(prefix) + symbol.size() + 2 > 480) continue;
++                dest += prefix;
++                dest += symbol;
++                dest += "; ";
++                ++counter;
++            }
++            runtime_report().note_jni_detail(
++                "guest-exit-code-candidates",
++                "unity:" + (unity_code.empty() ? "none" : unity_code) +
++                " mono:" + (mono_code.empty() ? "none" : mono_code) +
++                " other:" + (other_code.empty() ? "none" : other_code), true);
++        }
++        {
++            // ARM ABI frame pointers vary; show nearby words without pretending
++            // to unwind an entire call chain from r11.
++            std::string probe;
++            for (int d = -16; d <= 16; d += 4) {
++                const std::int64_t a = static_cast<std::int64_t>(regs[11]) + d;
++                if (a <= 0 || a > 0xfffffffbLL) continue;
++                const auto* src = c.mem.host_ptr(static_cast<std::uint32_t>(a), 4, kPageRead);
++                if (!src) continue;
++                std::uint32_t word = 0;
++                std::memcpy(&word, src, 4);
++                char buf[40];
++                std::snprintf(buf, sizeof buf, "fp%+d=%08x ", d, word);
++                probe += buf;
++            }
++            runtime_report().note_jni_detail("guest-exit-fp-probe", probe, true);
++        }
++        // Stage 29: flush diagnostic records before the multi-thread _Exit.
++        {
++            std::array<Ktb29Failure, 64> failures{};
++            std::uint64_t count = 0, enosys = 0, enomem = 0;
++            std::string stderr_text;
++            {
++                std::lock_guard<std::mutex> lock(ktb29_mutex);
++                failures = ktb29_failures;
++                count = ktb29_failure_count;
++                enosys = ktb29_enosys_count;
++                enomem = ktb29_enomem_count;
++                stderr_text = ktb29_stderr;
++            }
++            char totals[150];
++            std::snprintf(totals, sizeof totals,
++                          "total=%llu ENOSYS=%llu ENOMEM=%llu",
++                          static_cast<unsigned long long>(count),
++                          static_cast<unsigned long long>(enosys),
++                          static_cast<unsigned long long>(enomem));
++            runtime_report().note_gl_detail("ktb29-failure-totals", totals, true);
++            runtime_report().note_gl_detail("ktb29-guest-stderr",
++                stderr_text.empty() ? "(none)" : stderr_text.substr(stderr_text.size() > 500 ? stderr_text.size()-500 : 0), true);
++            const std::uint64_t n = std::min<std::uint64_t>(count, failures.size());
++            const std::uint64_t begin = count - n;
++            // List most recent failures first, 4 per report field for readability.
++            for (int group = 0; group < 8 && group * 4 < n; ++group) {
++                std::string summary;
++                for (int j = 0; j < 4 && group * 4 + j < n; ++j) {
++                    const std::uint64_t id = count - 1u - static_cast<std::uint64_t>(group * 4 + j);
++                    if (id < begin) break;
++                    const Ktb29Failure& f = failures[static_cast<std::size_t>(id % failures.size())];
++                    char item[130];
++                    std::snprintf(item, sizeof item,
++                                  "#%llu %s(%u)=%d tid=%d pc=%08x lr=%08x a=%08x/%08x/%08x; ",
++                                  static_cast<unsigned long long>(f.seq), syscall_name(f.nr), f.nr,
++                                  f.result, f.tid, f.pc, f.lr, f.a0, f.a1, f.a2);
++                    if (summary.size() + std::strlen(item) > 510) break;
++                    summary += item;
++                }
++                runtime_report().note_gl_detail("ktb29-fail-" + std::to_string(group+1), summary, true);
++            }
++        }
++        proc.request_exit(status);
++        if (threads > 1) std::_Exit(status);
+         return false;
++    }
+     case NR_clone: {
+         constexpr std::uint32_t kRequired = 0x00000100 | 0x00010000;  // CLONE_VM | CLONE_THREAD
+         if ((c.a[0] & kRequired) != kRequired) {
+@@ -1221,7 +1890,10 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+     }
+ 
+     case NR_read: res = sys_read_write(c, false); break;
+-    case NR_write: res = sys_read_write(c, true); break;
++    case NR_write:
++        ktb29_record_guest_output(c);
++        res = sys_read_write(c, true);
++        break;
+     case NR_pread64: res = sys_pread_pwrite(c, false); break;
+     case NR_pwrite64: res = sys_pread_pwrite(c, true); break;
+     case NR_readv: res = sys_readv_writev(c, false); break;
+@@ -1245,6 +1917,20 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+         res = sys_path_call(c, 1, [](Ctx& x, const char* p) -> long {
+             return ::syscall(SYS_openat, static_cast<int>(x.a[0]), p, static_cast<int>(x.a[2]), static_cast<mode_t>(x.a[3]));
+         });
++        // Stage 30: diagnose any Mono assembly lookup after APK-path translation.
++        if (guest_path != nullptr &&
++            (std::strstr(guest_path, "mscorlib.dll") != nullptr ||
++             std::strstr(guest_path, "Assembly-CSharp.dll") != nullptr)) {
++            static std::atomic<unsigned> ktb30_assembly_attempts{0};
++            const unsigned attempt = ktb30_assembly_attempts.fetch_add(1) + 1;
++            if (attempt <= 12) {
++                const std::string translated = proc.translate_path(guest_path);
++                runtime_report().note_gl_detail(
++                    "ktb30-assembly-open-" + std::to_string(attempt),
++                    std::string("result=") + std::to_string(res) + " guest=" + guest_path +
++                    " host=" + translated, true);
++            }
++        }
+         if (watched) note_watched_open(guest_path, res);
+         break;
+     }
+@@ -1283,6 +1969,22 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+             break;
+         }
+         const std::string host_path = proc.translate_path(path);
++        if (ktb32_virtual_assets_link(path, host_path)) {
++            struct stat link_target{};
++            if (::stat(host_path.c_str(), &link_target) == 0 && S_ISDIR(link_target.st_mode)) {
++                if (c.a[3] == 0) {
++                    res = -EINVAL;
++                } else {
++                    const std::size_t n = std::min<std::size_t>(host_path.size(), c.a[3]);
++                    std::memcpy(buf, host_path.data(), n);
++                    res = static_cast<std::int32_t>(n);
++                    runtime_report().note_gl_detail(
++                        "ktb32-asset-readlink", std::string("symlink ") + path +
++                        " -> " + host_path, true);
++                }
++                break;
++            }
++        }
+         res = result_of(::readlinkat(static_cast<int>(c.a[0]), host_path.c_str(), reinterpret_cast<char*>(buf), c.a[3]));
+         break;
+     }
+@@ -1706,6 +2408,8 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
+         break;
+     }
+ 
++    ktb29_record_failure(nr, {c.a[0], c.a[1], c.a[2], c.a[3], c.a[4], c.a[5]}, thread, res);
++    wwz_diag_path(c, nr, res);  // zb-wwz-diag
+     if (trace_enabled()) {
+         log("%s(0x%x, 0x%x, 0x%x, 0x%x) = %d", syscall_name(nr), c.a[0], c.a[1], c.a[2], c.a[3], res);
+     }
+diff --git a/guest/compat/zbcompat.c b/guest/compat/zbcompat.c
+index f903d74..8ad0946 100644
+--- a/guest/compat/zbcompat.c
++++ b/guest/compat/zbcompat.c
+@@ -15,3 +15,67 @@ long long __aeabi_d2lz(double value) {
+     unsigned long long result = ((unsigned long long)high << 32) | low;
+     return negative ? -(long long)result : (long long)result;
+ }
++
++
++/* zb-stdio-seek: fopen for games with their own copy of the old BSD stdio (see
++ * tools/../zb_stdio_seek.py). Classic 32-bit FILE layout, which bionic keeps for LP32. */
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <unistd.h>
++
++struct zb_old_sbuf {
++    unsigned char* base;
++    int size;
++};
++
++struct zb_old_file {
++    unsigned char* p;
++    int r;
++    int w;
++    short flags;
++    short file;
++    struct zb_old_sbuf bf;
++    int lbfsize;
++    void* cookie;
++    int (*close_fn)(void*);
++    int (*read_fn)(void*, char*, int);
++    long (*seek_fn)(void*, long, int);
++    int (*write_fn)(void*, const char*, int);
++};
++
++_Static_assert(sizeof(void*) == 4, "the classic FILE layout is the 32-bit one");
++_Static_assert(__builtin_offsetof(struct zb_old_file, seek_fn) == 40, "FILE::_seek offset");
++
++static long zb_old_sseek(void* cookie, long offset, int whence) {
++    const struct zb_old_file* fp = (const struct zb_old_file*)cookie;
++    return (long)lseek(fp->file, (off_t)offset, whence);
++}
++
++/* Not named fopen: zbhost binds it into libraries with the old static stdio. */
++FILE* zb_classic_fopen(const char* path, const char* mode) {
++    int flags;
++    switch (mode[0]) {
++    case 'r': flags = O_RDONLY; break;
++    case 'w': flags = O_WRONLY | O_CREAT | O_TRUNC; break;
++    case 'a': flags = O_WRONLY | O_CREAT | O_APPEND; break;
++    default: errno = EINVAL; return NULL;
++    }
++    for (const char* m = mode + 1; *m != '\0'; ++m) {
++        if (*m == '+') flags = (flags & ~O_ACCMODE) | O_RDWR;
++        else if (*m == 'e') flags |= O_CLOEXEC;
++        else if (*m == 'x') flags |= O_EXCL;
++    }
++    const int fd = open(path, flags | O_LARGEFILE, 0666);
++    if (fd < 0) return NULL;
++    FILE* fp = fdopen(fd, mode);
++    if (fp == NULL) {
++        const int saved = errno;
++        close(fd);
++        errno = saved;
++        return NULL;
++    }
++    struct zb_old_file* old = (struct zb_old_file*)fp;
++    if (old->seek_fn == NULL && old->cookie == (void*)fp) old->seek_fn = zb_old_sseek;
++    return fp;
++}
+diff --git a/guest/stubs/gen/libGLESv1_CM.S b/guest/stubs/gen/libGLESv1_CM.S
+index 842bc4a..f3f98fe 100644
+--- a/guest/stubs/gen/libGLESv1_CM.S
++++ b/guest/stubs/gen/libGLESv1_CM.S
+@@ -1162,3 +1162,117 @@ glViewport:
+     svc #0x5a008d
+     bx lr
+ .size glViewport, . - glViewport
++
++@ KTB stage20: Unity 4.0 GLES1 OES aliases
++.global glBindFramebufferOES
++.type glBindFramebufferOES, %function
++.p2align 2
++glBindFramebufferOES:
++    svc #0x5a0004
++    bx lr
++.size glBindFramebufferOES, . - glBindFramebufferOES
++
++.global glBindRenderbufferOES
++.type glBindRenderbufferOES, %function
++.p2align 2
++glBindRenderbufferOES:
++    svc #0x5a0005
++    bx lr
++.size glBindRenderbufferOES, . - glBindRenderbufferOES
++
++.global glCheckFramebufferStatusOES
++.type glCheckFramebufferStatusOES, %function
++.p2align 2
++glCheckFramebufferStatusOES:
++    svc #0x5a000e
++    bx lr
++.size glCheckFramebufferStatusOES, . - glCheckFramebufferStatusOES
++
++.global glDeleteFramebuffersOES
++.type glDeleteFramebuffersOES, %function
++.p2align 2
++glDeleteFramebuffersOES:
++    svc #0x5a001d
++    bx lr
++.size glDeleteFramebuffersOES, . - glDeleteFramebuffersOES
++
++.global glDeleteRenderbuffersOES
++.type glDeleteRenderbuffersOES, %function
++.p2align 2
++glDeleteRenderbuffersOES:
++    svc #0x5a001f
++    bx lr
++.size glDeleteRenderbuffersOES, . - glDeleteRenderbuffersOES
++
++.global glFramebufferRenderbufferOES
++.type glFramebufferRenderbufferOES, %function
++.p2align 2
++glFramebufferRenderbufferOES:
++    svc #0x5a002e
++    bx lr
++.size glFramebufferRenderbufferOES, . - glFramebufferRenderbufferOES
++
++.global glFramebufferTexture2DOES
++.type glFramebufferTexture2DOES, %function
++.p2align 2
++glFramebufferTexture2DOES:
++    svc #0x5a002f
++    bx lr
++.size glFramebufferTexture2DOES, . - glFramebufferTexture2DOES
++
++.global glGenFramebuffersOES
++.type glGenFramebuffersOES, %function
++.p2align 2
++glGenFramebuffersOES:
++    svc #0x5a0032
++    bx lr
++.size glGenFramebuffersOES, . - glGenFramebuffersOES
++
++.global glGenRenderbuffersOES
++.type glGenRenderbuffersOES, %function
++.p2align 2
++glGenRenderbuffersOES:
++    svc #0x5a0033
++    bx lr
++.size glGenRenderbuffersOES, . - glGenRenderbuffersOES
++
++.global glGenerateMipmapOES
++.type glGenerateMipmapOES, %function
++.p2align 2
++glGenerateMipmapOES:
++    svc #0x5a0035
++    bx lr
++.size glGenerateMipmapOES, . - glGenerateMipmapOES
++
++.global glGetFramebufferAttachmentParameterivOES
++.type glGetFramebufferAttachmentParameterivOES, %function
++.p2align 2
++glGetFramebufferAttachmentParameterivOES:
++    svc #0x5a003e
++    bx lr
++.size glGetFramebufferAttachmentParameterivOES, . - glGetFramebufferAttachmentParameterivOES
++
++.global glMapBufferOES
++.type glMapBufferOES, %function
++.p2align 2
++glMapBufferOES:
++    svc #0x5a0153
++    bx lr
++.size glMapBufferOES, . - glMapBufferOES
++
++.global glRenderbufferStorageOES
++.type glRenderbufferStorageOES, %function
++.p2align 2
++glRenderbufferStorageOES:
++    svc #0x5a005e
++    bx lr
++.size glRenderbufferStorageOES, . - glRenderbufferStorageOES
++
++.global glUnmapBufferOES
++.type glUnmapBufferOES, %function
++.p2align 2
++glUnmapBufferOES:
++    svc #0x5a0154
++    bx lr
++.size glUnmapBufferOES, . - glUnmapBufferOES
++
+diff --git a/guest/zbhost/zbhost.c b/guest/zbhost/zbhost.c
+index df1e66f..e19a848 100644
+--- a/guest/zbhost/zbhost.c
++++ b/guest/zbhost/zbhost.c
+@@ -29,8 +29,118 @@ static uint32_t host_call(uint32_t index, uint32_t arg) {
+     return r0;
+ }
+ 
++/* zb-stdio-seek: libraries with their own copy of the old BSD stdio (Unreal Engine 3 and other
++ * NDK r4-r8 era code) seek through FILE::_seek, which modern bionic's fopen leaves NULL. Their
++ * imported fopen is pointed at zb_classic_fopen (libzbcompat.so), which fills it. */
++#include <elf.h>
++#include <link.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#ifndef R_ARM_GLOB_DAT
++#define R_ARM_GLOB_DAT 21
++#endif
++#ifndef R_ARM_JUMP_SLOT
++#define R_ARM_JUMP_SLOT 22
++#endif
++
++static uintptr_t zb_stdio_seen[128];
++static int zb_stdio_seen_count;
++
++static int (*zb_stdio_print)(int, const char*, const char*, ...);
++static void* zb_stdio_classic;
++
++/* Resolved before dl_iterate_phdr: the callback runs under the linker's lock. */
++static void zb_stdio_prepare(void) {
++    if (zb_stdio_classic == NULL) zb_stdio_classic = dlsym(RTLD_DEFAULT, "zb_classic_fopen");
++    if (zb_stdio_print == NULL) {
++        void* liblog = dlopen("liblog.so", RTLD_NOW);
++        if (liblog != NULL) {
++            zb_stdio_print = (int (*)(int, const char*, const char*, ...))dlsym(liblog, "__android_log_print");
++        }
++    }
++}
++
++static void zb_stdio_log(const char* name, int slots) {
++    if (zb_stdio_print != NULL) zb_stdio_print(4, "zbhost", "classic stdio for %s: %d fopen slot(s)", name, slots);
++}
++
++static int zb_stdio_patch_relocs(uintptr_t base, const Elf32_Rel* rel, size_t size, const Elf32_Sym* symtab,
++                                 const char* strtab, void* classic) {
++    int patched = 0;
++    const long page = sysconf(_SC_PAGESIZE);
++    for (size_t i = 0; rel != NULL && i < size / sizeof(Elf32_Rel); ++i) {
++        const unsigned type = ELF32_R_TYPE(rel[i].r_info);
++        const Elf32_Sym* sym = &symtab[ELF32_R_SYM(rel[i].r_info)];
++        if ((type != R_ARM_JUMP_SLOT && type != R_ARM_GLOB_DAT) || sym->st_shndx != SHN_UNDEF) continue;
++        if (strcmp(strtab + sym->st_name, "fopen") != 0) continue;
++        void** slot = (void**)(base + rel[i].r_offset);
++        void* first = (void*)((uintptr_t)slot & ~(uintptr_t)(page - 1));
++        if (mprotect(first, (size_t)page, PROT_READ | PROT_WRITE) != 0) continue;
++        *slot = classic;
++        ++patched;
++    }
++    return patched;
++}
++
++static int zb_stdio_object(struct dl_phdr_info* info, size_t size, void* data) {
++    (void)size;
++    (void)data;
++    const uintptr_t base = (uintptr_t)info->dlpi_addr;
++    for (int i = 0; i < zb_stdio_seen_count; ++i) {
++        if (zb_stdio_seen[i] == base) return 0;
++    }
++    if (zb_stdio_seen_count < (int)(sizeof(zb_stdio_seen) / sizeof(zb_stdio_seen[0]))) {
++        zb_stdio_seen[zb_stdio_seen_count++] = base;
++    }
++    const Elf32_Dyn* dyn = NULL;
++    for (int i = 0; i < info->dlpi_phnum; ++i) {
++        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (const Elf32_Dyn*)(base + info->dlpi_phdr[i].p_vaddr);
++    }
++    if (dyn == NULL) return 0;
++    const Elf32_Sym* symtab = NULL;
++    const char* strtab = NULL;
++    const Elf32_Word* hash = NULL;
++    const Elf32_Rel* jmprel = NULL;
++    const Elf32_Rel* rel = NULL;
++    size_t jmprel_size = 0, rel_size = 0;
++    for (const Elf32_Dyn* d = dyn; d->d_tag != DT_NULL; ++d) {
++        switch (d->d_tag) {
++        case DT_SYMTAB: symtab = (const Elf32_Sym*)(base + d->d_un.d_ptr); break;
++        case DT_STRTAB: strtab = (const char*)(base + d->d_un.d_ptr); break;
++        case DT_HASH: hash = (const Elf32_Word*)(base + d->d_un.d_ptr); break;
++        case DT_JMPREL: jmprel = (const Elf32_Rel*)(base + d->d_un.d_ptr); break;
++        case DT_PLTRELSZ: jmprel_size = d->d_un.d_val; break;
++        case DT_REL: rel = (const Elf32_Rel*)(base + d->d_un.d_ptr); break;
++        case DT_RELSZ: rel_size = d->d_un.d_val; break;
++        default: break;
++        }
++    }
++    if (symtab == NULL || strtab == NULL || hash == NULL) return 0;
++    int has_fseeko = 0, has_sdidinit = 0;
++    for (Elf32_Word i = 1; i < hash[1]; ++i) {
++        if (symtab[i].st_shndx == SHN_UNDEF) continue;
++        const char* name = strtab + symtab[i].st_name;
++        if (strcmp(name, "fseeko") == 0) has_fseeko = 1;
++        else if (strcmp(name, "__sdidinit") == 0) has_sdidinit = 1;
++    }
++    if (!has_fseeko || !has_sdidinit) return 0;
++    void* classic = zb_stdio_classic;
++    if (classic == NULL) return 0;
++    const int slots = zb_stdio_patch_relocs(base, jmprel, jmprel_size, symtab, strtab, classic) +
++                      zb_stdio_patch_relocs(base, rel, rel_size, symtab, strtab, classic);
++    zb_stdio_log(info->dlpi_name != NULL ? info->dlpi_name : "?", slots);
++    return 0;
++}
++
+ static uint32_t service_dlopen(const char* path, uint32_t flags) {
+-    return (uint32_t)(uintptr_t)dlopen(path, (int)flags);
++    void* handle = dlopen(path, (int)flags);
++    if (handle != NULL) {  /* zb-stdio-seek */
++        zb_stdio_prepare();
++        dl_iterate_phdr(zb_stdio_object, NULL);
++    }
++    return (uint32_t)(uintptr_t)handle;
+ }
+ 
+ static uint32_t service_dlsym(uint32_t handle, const char* name) {
+diff --git a/third_party/dynarmic b/third_party/dynarmic
+--- a/third_party/dynarmic
++++ b/third_party/dynarmic
+@@ -1 +1 @@
+-Subproject commit 86458a0bd369d63ba4c2ef812cacbb6c9080c065
++Subproject commit 86458a0bd369d63ba4c2ef812cacbb6c9080c065-dirty
+diff --git a/tools/gen_stubs.py b/tools/gen_stubs.py
+index 8b50504..8234a1d 100755
+--- a/tools/gen_stubs.py
++++ b/tools/gen_stubs.py
+@@ -289,6 +289,29 @@ def main():
+             index += 1
+         print("%s: %d functions" % (lib, len(names)))
+ 
++    # BEGIN KTB_STAGE20_GLES1_OES
++    # Unity 4.0 imports OES framebuffer symbols from GLES1. Reuse GLES2 host-call
++    # indices (including mapbuffer OES), without adding/renumbering host calls.
++    oes_aliases = {'glBindFramebufferOES': 'glBindFramebuffer', 'glBindRenderbufferOES': 'glBindRenderbuffer', 'glCheckFramebufferStatusOES': 'glCheckFramebufferStatus', 'glDeleteFramebuffersOES': 'glDeleteFramebuffers', 'glDeleteRenderbuffersOES': 'glDeleteRenderbuffers', 'glFramebufferRenderbufferOES': 'glFramebufferRenderbuffer', 'glFramebufferTexture2DOES': 'glFramebufferTexture2D', 'glGenFramebuffersOES': 'glGenFramebuffers', 'glGenRenderbuffersOES': 'glGenRenderbuffers', 'glGenerateMipmapOES': 'glGenerateMipmap', 'glGetFramebufferAttachmentParameterivOES': 'glGetFramebufferAttachmentParameteriv', 'glMapBufferOES': 'glMapBufferOES', 'glRenderbufferStorageOES': 'glRenderbufferStorage', 'glUnmapBufferOES': 'glUnmapBufferOES'}
++    gles1_lines = assemblies["libGLESv1_CM"]
++    for oes, target in oes_aliases.items():
++        if target not in assigned:
++            sys.exit("KTB stage20: missing host-call " + target)
++        if any(line == ".global " + oes for line in gles1_lines):
++            continue
++        ix = assigned[target]
++        gles1_lines.extend([
++            ".global " + oes,
++            ".type " + oes + ", %function",
++            ".p2align 2",
++            oes + ":",
++            "    svc #0x%x" % (HOST_CALL_BASE | ix),
++            "    bx lr",
++            ".size " + oes + ", . - " + oes,
++            "",
++        ])
++    # END KTB_STAGE20_GLES1_OES
++
+     for lib, lines in assemblies.items():
+         with open(os.path.join(out_asm, lib + ".S"), "w") as f:
+             f.write("\n".join(lines))
